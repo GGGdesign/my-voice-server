@@ -24,18 +24,24 @@ const SECRET_PATH =
 
 const GAME_ROOM = "maxchat_greedy_lion_global";
 const GAME_PATH = "greedyLionGame";
-const ROUND_MS = 25000;
 
+const ROUND_MS = 25000;
 const FOOD_MULTIPLIERS = [
   45, 5, 5, 10, 15, 5, 5, 25
 ];
 
+const ALLOWED_CHIPS = [
+  100, 500, 1000, 5000, 10000
+];
+
+const MAX_SLOTS = 6;
+
+// Keep disabled until Android integration is tested.
 const BETTING_ENABLED = false;
 
 let firebaseReady = false;
 let gameState = null;
-let saving = false;
-let pendingSave = false;
+let clockBusy = false;
 
 try {
   if (fs.existsSync(SECRET_PATH)) {
@@ -67,26 +73,32 @@ function initialState() {
     roundNumber: 1,
     roundStartsAt: now,
     roundEndsAt: now + ROUND_MS,
-    history: []
+    history: [],
+    bets: {}
   };
 }
 
-function getHistory(state) {
-  return Array.isArray(state?.history)
-    ? state.history
-    : [];
-}
-
 function validState(state) {
-  return (
+  return Boolean(
     state &&
-    typeof state === "object" &&
     Number.isSafeInteger(state.roundNumber) &&
     state.roundNumber > 0 &&
     Number.isFinite(state.roundStartsAt) &&
     Number.isFinite(state.roundEndsAt) &&
     state.roundEndsAt > state.roundStartsAt
   );
+}
+
+function historyArray(value) {
+  if (Array.isArray(value)) return value;
+
+  if (value && typeof value === "object") {
+    return Object.keys(value)
+      .sort((a, b) => Number(a) - Number(b))
+      .map(key => value[key]);
+  }
+
+  return [];
 }
 
 function publicState() {
@@ -97,104 +109,225 @@ function publicState() {
     roundStartsAt: gameState.roundStartsAt,
     roundEndsAt: gameState.roundEndsAt,
     serverTime: Date.now(),
-    phase: "betting_disabled",
-    bettingEnabled: false,
-    history: getHistory(gameState).slice(-8),
-    multipliers: FOOD_MULTIPLIERS
+    phase: BETTING_ENABLED
+      ? "betting"
+      : "betting_disabled",
+    bettingEnabled:
+      BETTING_ENABLED && firebaseReady,
+    multipliers: FOOD_MULTIPLIERS,
+    history: historyArray(
+      gameState.history
+    ).slice(-8)
   };
 }
 
-function sendClock(target) {
-  if (!gameState) return;
-
-  target.emit("greedy_lion_clock", {
-    roundNumber: gameState.roundNumber,
-    roundEndsAt: gameState.roundEndsAt,
-    serverTime: Date.now()
-  });
-}
-
-function sendState(target) {
+function broadcastState() {
   const state = publicState();
 
   if (state) {
-    target.emit("greedy_lion_state", state);
-  }
-}
-
-// Save game state without blocking the timer.
-// This server assumes one active Render instance.
-async function saveState() {
-  if (!firebaseReady || !gameState) return;
-
-  if (saving) {
-    pendingSave = true;
-    return;
-  }
-
-  saving = true;
-
-  try {
-    do {
-      pendingSave = false;
-
-      const snapshot = JSON.parse(
-        JSON.stringify(gameState)
-      );
-
-      await admin.database()
-        .ref(GAME_PATH)
-        .set(snapshot);
-
-      console.log(
-        "ROUND SAVED:",
-        snapshot.roundNumber
-      );
-    } while (pendingSave);
-  } catch (error) {
-    console.error(
-      "FIREBASE SAVE ERROR:",
-      error.message
+    io.to(GAME_ROOM).emit(
+      "greedy_lion_state",
+      state
     );
-  } finally {
-    saving = false;
   }
 }
 
-// The game clock is independent of Firebase.
-function finishRound() {
+function broadcastClock() {
   if (!gameState) return;
 
-  const now = Date.now();
+  io.to(GAME_ROOM).emit(
+    "greedy_lion_clock",
+    {
+      roundNumber: gameState.roundNumber,
+      roundEndsAt: gameState.roundEndsAt,
+      serverTime: Date.now()
+    }
+  );
+}
 
-  if (now < gameState.roundEndsAt) {
+async function loadGame() {
+  if (!firebaseReady) {
+    gameState = initialState();
     return;
   }
 
-  const completedRound = gameState.roundNumber;
+  const ref = admin.database().ref(GAME_PATH);
+
+  const result = await ref.transaction(
+    current => {
+      if (validState(current)) {
+        return current;
+      }
+
+      return initialState();
+    },
+    undefined,
+    false
+  );
+
+  gameState = result.snapshot.val();
+
+  console.log(
+    "Game loaded:",
+    gameState.roundNumber
+  );
+}
+
+async function finishRound() {
+  if (!gameState) return;
+
+  if (Date.now() < gameState.roundEndsAt) {
+    return;
+  }
+
+  // Offline fallback is for visual testing only.
+  if (!firebaseReady) {
+    const now = Date.now();
+
+    const result = {
+      roundNumber: gameState.roundNumber,
+      winningIndex: crypto.randomInt(8),
+      completedAt: now,
+      hasSettledBets: false
+    };
+
+    gameState.history = [
+      ...historyArray(gameState.history),
+      result
+    ].slice(-8);
+
+    gameState.roundNumber += 1;
+    gameState.roundStartsAt = now;
+    gameState.roundEndsAt = now + ROUND_MS;
+
+    io.to(GAME_ROOM).emit(
+      "greedy_lion_round_result",
+      result
+    );
+
+    broadcastState();
+    return;
+  }
+
   const winner = crypto.randomInt(8);
+  const now = Date.now();
 
-  const result = {
-    roundNumber: completedRound,
-    winningIndex: winner,
-    completedAt: now,
-    hasSettledBets: false
-  };
+  let finished = null;
 
-  gameState.history = [
-    ...getHistory(gameState),
-    result
-  ].slice(-8);
+  // One atomic transaction for the game and
+  // every affected wallet. Never pay twice.
+  const tx = await admin.database()
+    .ref("/")
+    .transaction(root => {
+      if (!root || typeof root !== "object") {
+        return;
+      }
 
-  gameState.roundNumber += 1;
-  gameState.roundStartsAt = now;
-  gameState.roundEndsAt = now + ROUND_MS;
+      const game = root[GAME_PATH];
+
+      if (!validState(game)) return;
+
+      if (Date.now() < game.roundEndsAt) {
+        return;
+      }
+
+      const bets = game.bets || {};
+      const roundNumber = game.roundNumber;
+
+      const payouts = {};
+
+      for (const bet of Object.values(bets)) {
+        if (!bet || !bet.uid) continue;
+
+        if (bet.foodIndex !== winner) {
+          continue;
+        }
+
+        const amount = Number(bet.amount);
+
+        if (!ALLOWED_CHIPS.includes(amount)) {
+          return;
+        }
+
+        const payout =
+          amount * FOOD_MULTIPLIERS[winner];
+
+        payouts[bet.uid] =
+          (payouts[bet.uid] || 0) +
+          payout;
+      }
+
+      for (const [uid, payout] of
+        Object.entries(payouts)) {
+
+        const user = root.Users?.[uid];
+
+        if (!user) return;
+
+        const balance = Number(user.coins);
+
+        if (
+          !Number.isSafeInteger(balance) ||
+          balance < 0 ||
+          !Number.isSafeInteger(payout) ||
+          !Number.isSafeInteger(balance + payout)
+        ) {
+          return;
+        }
+
+        user.coins = balance + payout;
+      }
+
+      const result = {
+        roundNumber,
+        winningIndex: winner,
+        completedAt: now,
+        hasSettledBets: true
+      };
+
+      game.history = [
+        ...historyArray(game.history),
+        result
+      ].slice(-8);
+
+      game.roundNumber = roundNumber + 1;
+      game.roundStartsAt = now;
+      game.roundEndsAt = now + ROUND_MS;
+      game.bets = {};
+
+      root[GAME_PATH] = game;
+
+      return root;
+    }, undefined, false);
+
+  if (!tx.committed) {
+    return;
+  }
+
+  const updated = tx.snapshot
+    .child(GAME_PATH)
+    .val();
+
+  if (!validState(updated)) return;
+
+  gameState = updated;
+
+  finished = historyArray(
+    updated.history
+  ).slice(-1)[0];
+
+  if (finished) {
+    io.to(GAME_ROOM).emit(
+      "greedy_lion_round_result",
+      finished
+    );
+  }
 
   console.log(
     "ROUND FINISHED:",
-    completedRound,
+    finished?.roundNumber,
     "WINNER:",
-    winner
+    finished?.winningIndex
   );
 
   console.log(
@@ -202,95 +335,207 @@ function finishRound() {
     gameState.roundNumber
   );
 
-  io.to(GAME_ROOM).emit(
-    "greedy_lion_round_result",
-    result
-  );
+  broadcastState();
+}
 
-  sendState(io.to(GAME_ROOM));
-  sendClock(io.to(GAME_ROOM));
+async function placeBet(data, ack) {
+  const reply =
+    typeof ack === "function"
+      ? ack
+      : () => {};
 
-  // Saving happens in the background.
-  saveState().catch(error => {
+  if (!BETTING_ENABLED || !firebaseReady) {
+    reply({
+      ok: false,
+      error: "BETTING_DISABLED",
+      message:
+        "الرهانات مغلقة مؤقتًا لحماية الرصيد"
+    });
+    return;
+  }
+
+  if (!gameState) {
+    reply({
+      ok: false,
+      error: "GAME_NOT_READY"
+    });
+    return;
+  }
+
+  try {
+    const token = data?.idToken;
+    const betId = data?.betId;
+    const foodIndex = data?.foodIndex;
+    const amount = data?.amount;
+    const requestedRound = data?.roundNumber;
+
+    if (
+      typeof token !== "string" ||
+      !/^[a-zA-Z0-9_-]{8,100}$/.test(
+        String(betId || "")
+      ) ||
+      !Number.isInteger(foodIndex) ||
+      foodIndex < 0 ||
+      foodIndex >= 8 ||
+      !ALLOWED_CHIPS.includes(amount) ||
+      !Number.isSafeInteger(requestedRound)
+    ) {
+      reply({
+        ok: false,
+        error: "INVALID_BET"
+      });
+      return;
+    }
+
+    // Never trust a UID sent by the phone.
+    const verified = await admin.auth()
+      .verifyIdToken(token, true);
+
+    const uid = verified.uid;
+
+    let rejection = "BET_REJECTED";
+
+    const tx = await admin.database()
+      .ref("/")
+      .transaction(root => {
+        if (!root || typeof root !== "object") {
+          rejection = "DATABASE_NOT_READY";
+          return;
+        }
+
+        const game = root[GAME_PATH];
+        const user = root.Users?.[uid];
+
+        if (!validState(game) || !user) {
+          rejection = "GAME_OR_USER_MISSING";
+          return;
+        }
+
+        if (
+          game.roundNumber !== requestedRound ||
+          Date.now() >= game.roundEndsAt
+        ) {
+          rejection = "ROUND_CLOSED";
+          return;
+        }
+
+        if (!game.bets) {
+          game.bets = {};
+        }
+
+        const key = uid + "_" + betId;
+
+        // Duplicate request cannot debit twice.
+        if (game.bets[key]) {
+          rejection = "DUPLICATE_BET";
+          return;
+        }
+
+        const userBets = Object.values(
+          game.bets
+        ).filter(bet => bet.uid === uid);
+
+        const chosenSlots = new Set(
+          userBets.map(bet => bet.foodIndex)
+        );
+
+        if (
+          !chosenSlots.has(foodIndex) &&
+          chosenSlots.size >= MAX_SLOTS
+        ) {
+          rejection = "MAX_SIX_SLOTS";
+          return;
+        }
+
+        const balance = Number(user.coins);
+
+        if (
+          !Number.isSafeInteger(balance) ||
+          balance < amount
+        ) {
+          rejection = "INSUFFICIENT_COINS";
+          return;
+        }
+
+        user.coins = balance - amount;
+
+        game.bets[key] = {
+          uid,
+          betId,
+          foodIndex,
+          amount,
+          roundNumber: requestedRound,
+          createdAt: Date.now()
+        };
+
+        return root;
+      }, undefined, false);
+
+    if (!tx.committed) {
+      reply({
+        ok: false,
+        error: rejection
+      });
+      return;
+    }
+
+    gameState = tx.snapshot
+      .child(GAME_PATH)
+      .val();
+
+    reply({
+      ok: true,
+      betId,
+      foodIndex,
+      amount,
+      roundNumber: requestedRound
+    });
+
+    console.log(
+      "BET ACCEPTED:",
+      requestedRound,
+      foodIndex,
+      amount
+    );
+
+  } catch (error) {
     console.error(
-      "SAVE ERROR:",
+      "BET ERROR:",
       error.message
     );
-  });
-}
 
-function gameTick() {
-  if (!gameState) return;
-
-  finishRound();
-
-  sendClock(io.to(GAME_ROOM));
-}
-
-setInterval(gameTick, 1000);
-
-async function initializeGame() {
-  let loaded = null;
-
-  if (firebaseReady) {
-    try {
-      const snapshot = await admin.database()
-        .ref(GAME_PATH)
-        .once("value");
-
-      loaded = snapshot.val();
-    } catch (error) {
-      console.error(
-        "FIREBASE LOAD ERROR:",
-        error.message
-      );
-    }
+    reply({
+      ok: false,
+      error: "BET_FAILED"
+    });
   }
+}
 
-  if (validState(loaded)) {
-    gameState = {
-      roundNumber: loaded.roundNumber,
-      roundStartsAt: loaded.roundStartsAt,
-      roundEndsAt: loaded.roundEndsAt,
-      history: getHistory(loaded).slice(-8)
-    };
+setInterval(async () => {
+  if (clockBusy || !gameState) return;
 
-    console.log(
-      "Loaded saved round:",
-      gameState.roundNumber
+  clockBusy = true;
+
+  try {
+    await finishRound();
+    broadcastClock();
+  } catch (error) {
+    console.error(
+      "GAME CLOCK ERROR:",
+      error.message
     );
-  } else {
-    gameState = initialState();
-
-    console.log(
-      "Starting new game clock"
-    );
+  } finally {
+    clockBusy = false;
   }
-
-  // Recover from an expired saved round.
-  if (Date.now() >= gameState.roundEndsAt) {
-    finishRound();
-  }
-
-  console.log(
-    "GAME CLOCK READY:",
-    gameState.roundNumber
-  );
-
-  sendState(io.to(GAME_ROOM));
-  sendClock(io.to(GAME_ROOM));
-}
+}, 1000);
 
 io.on("connection", socket => {
-  console.log(
-    "User connected:",
-    socket.id
-  );
+  console.log("User connected:", socket.id);
 
   // Existing voice chat events
 
   socket.on("join_room", data => {
-    if (!data || !data.roomId) return;
+    if (!data?.roomId) return;
 
     const { roomId, userId, userName } = data;
 
@@ -303,7 +548,7 @@ io.on("connection", socket => {
   });
 
   socket.on("toggle_mute", data => {
-    if (!data || !data.roomId) return;
+    if (!data?.roomId) return;
 
     const { roomId, userId, isMuted } = data;
 
@@ -314,7 +559,7 @@ io.on("connection", socket => {
   });
 
   socket.on("sit_on_seat", data => {
-    if (!data || !data.roomId) return;
+    if (!data?.roomId) return;
 
     const { roomId, userId, seatIndex } = data;
 
@@ -325,7 +570,7 @@ io.on("connection", socket => {
   });
 
   socket.on("leave_seat", data => {
-    if (!data || !data.roomId) return;
+    if (!data?.roomId) return;
 
     const { roomId, userId } = data;
 
@@ -336,7 +581,7 @@ io.on("connection", socket => {
   });
 
   socket.on("start_audio_stream", data => {
-    if (!data || !data.roomId) return;
+    if (!data?.roomId) return;
 
     const { roomId, userId } = data;
 
@@ -347,7 +592,7 @@ io.on("connection", socket => {
   });
 
   socket.on("stop_audio_stream", data => {
-    if (!data || !data.roomId) return;
+    if (!data?.roomId) return;
 
     const { roomId, userId } = data;
 
@@ -358,7 +603,7 @@ io.on("connection", socket => {
   });
 
   socket.on("voice_data", data => {
-    if (!data || !data.roomId) return;
+    if (!data?.roomId) return;
 
     const { roomId, audioBuffer, userId } = data;
 
@@ -368,36 +613,42 @@ io.on("connection", socket => {
     );
   });
 
-  // Greedy Lion events
+  // Greedy Lion
 
   socket.on("greedy_lion_join", () => {
     socket.join(GAME_ROOM);
 
-    sendState(socket);
-    sendClock(socket);
+    const state = publicState();
 
-    console.log(
-      "Greedy Lion player joined"
-    );
-  });
+    if (state) {
+      socket.emit(
+        "greedy_lion_state",
+        state
+      );
+    }
 
-  socket.on("greedy_lion_leave", () => {
-    socket.leave(GAME_ROOM);
+    if (gameState) {
+      socket.emit(
+        "greedy_lion_clock",
+        {
+          roundNumber: gameState.roundNumber,
+          roundEndsAt: gameState.roundEndsAt,
+          serverTime: Date.now()
+        }
+      );
+    }
   });
 
   socket.on(
     "greedy_lion_place_bet",
     (data, ack) => {
-      if (typeof ack === "function") {
-        ack({
-          ok: false,
-          error: "BETTING_DISABLED",
-          message:
-            "الرهانات مغلقة مؤقتًا لحماية الرصيد"
-        });
-      }
+      placeBet(data, ack);
     }
   );
+
+  socket.on("greedy_lion_leave", () => {
+    socket.leave(GAME_ROOM);
+  });
 
   socket.on("disconnect", () => {
     console.log(
@@ -415,7 +666,8 @@ app.get("/", (req, res) => {
     game: "Greedy Lion",
     status: "online",
     firebaseReady,
-    bettingEnabled: BETTING_ENABLED,
+    bettingEnabled:
+      BETTING_ENABLED && firebaseReady,
     roundNumber:
       gameState?.roundNumber ?? null,
     secondsRemaining: gameState
@@ -423,13 +675,15 @@ app.get("/", (req, res) => {
           0,
           Math.ceil(
             (gameState.roundEndsAt - Date.now()) /
-              1000
+            1000
           )
         )
       : null,
-    lastResult:
-      getHistory(gameState).slice(-1)[0] ??
-      null
+    lastResult: gameState
+      ? historyArray(
+          gameState.history
+        ).slice(-1)[0] || null
+      : null
   });
 });
 
@@ -441,5 +695,17 @@ server.listen(PORT, async () => {
     PORT
   );
 
-  await initializeGame();
+  try {
+    await loadGame();
+
+    console.log(
+      "GAME READY:",
+      gameState.roundNumber
+    );
+  } catch (error) {
+    console.error(
+      "GAME STARTUP ERROR:",
+      error.message
+    );
+  }
 });
