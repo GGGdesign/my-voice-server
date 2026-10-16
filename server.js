@@ -29,14 +29,18 @@ const GAME_ROOM = "maxchat_greedy_lion_global";
 
 const ROUND_MS = 25000;
 const MULTIPLIERS = [45, 5, 5, 10, 15, 5, 5, 25];
+const CHIPS = [100, 500, 1000, 5000, 10000];
 
-// Betting stays disabled while the clock is repaired.
-// This value cannot accidentally be enabled in Render.
-const BETTING_ENABLED = false;
+const BETTING_ENABLED =
+  process.env.LION_ENABLE_BETS === "true";
 
 let firebaseReady = false;
 let game = null;
-let processing = false;
+
+let roundProcessing = false;
+let settlementProcessing = false;
+let loadProcessing = false;
+
 let lastSync = 0;
 
 try {
@@ -50,6 +54,7 @@ try {
   });
 
   firebaseReady = true;
+
   console.log("FIREBASE READY");
 } catch (error) {
   console.error("FIREBASE ERROR:", error.message);
@@ -93,8 +98,9 @@ function createGame(now) {
     roundNumber: 1,
     roundStartsAt: now,
     roundEndsAt: now + ROUND_MS,
-    history: [],
-    activeBets: {}
+    activeBets: {},
+    pendingSettlement: {},
+    history: []
   };
 }
 
@@ -116,8 +122,10 @@ function publicState() {
     roundEndsAt: game ? game.roundEndsAt : null,
     serverTime: Date.now(),
     secondsRemaining: remaining(),
-    bettingEnabled: BETTING_ENABLED,
-    phase: "betting_disabled",
+    bettingEnabled: BETTING_ENABLED && firebaseReady,
+    phase: BETTING_ENABLED
+      ? "betting"
+      : "betting_disabled",
     multipliers: MULTIPLIERS,
     history: game ? historyArray(game.history) : []
   };
@@ -147,12 +155,14 @@ function sendClock() {
   );
 }
 
-// Load the saved game without changing user balances.
 async function loadGame() {
-  if (!firebaseReady) return;
+  if (!firebaseReady || loadProcessing) return;
+
+  loadProcessing = true;
 
   try {
     const snapshot = await gameRef().once("value");
+
     let saved = snapshot.val();
 
     if (saved === null) {
@@ -171,30 +181,39 @@ async function loadGame() {
     }
 
     if (!validGame(saved)) {
-      console.error("INVALID SAVED GAME");
+      console.error("INVALID GAME DATA");
       return;
     }
 
     game = saved;
     lastSync = Date.now();
 
-    console.log(
-      "GAME LOADED:",
-      game.roundNumber
-    );
+    console.log("GAME LOADED:", game.roundNumber);
 
     sendState();
   } catch (error) {
     console.error("LOAD ERROR:", error.message);
+  } finally {
+    loadProcessing = false;
   }
 }
 
-// This function changes ONLY greedyLionGame.
-// It never locks the entire Firebase database.
-async function advanceGame() {
-  if (!firebaseReady || processing) return;
+/*
+  ROUND ENGINE
 
-  processing = true;
+  Only updates greedyLionGame.
+
+  Bets from the finished round are moved to
+  pendingSettlement.
+
+  Wallet settlement runs separately and cannot
+  intentionally hold the round timer.
+*/
+
+async function advanceGame() {
+  if (!firebaseReady || roundProcessing) return;
+
+  roundProcessing = true;
 
   try {
     const now = Date.now();
@@ -214,28 +233,23 @@ async function advanceGame() {
         const end = Number(current.roundEndsAt);
         const duration = end - start;
 
-        // Repair invalid timestamps or old 250-second
-        // rounds without deleting any existing data.
         if (
           duration !== ROUND_MS ||
           start > now + ROUND_MS
         ) {
-          const repairedStart =
-            now >= end ? now - ROUND_MS : now;
-
           return {
             ...current,
-            roundStartsAt: repairedStart,
-            roundEndsAt: repairedStart + ROUND_MS
+            roundStartsAt: now,
+            roundEndsAt: now + ROUND_MS
           };
         }
 
-        // Do nothing while the round is active.
-        if (now < end) {
+        if (Date.now() < end) {
           return;
         }
 
         const roundNumber = current.roundNumber;
+        const activeBets = current.activeBets || {};
 
         const result = {
           roundNumber,
@@ -244,10 +258,6 @@ async function advanceGame() {
           hasSettledBets: false
         };
 
-        const activeBets = current.activeBets || {};
-
-        // Preserve old unsettled bets.
-        // Do not let them block the next round.
         const pendingSettlement = {
           ...(current.pendingSettlement || {})
         };
@@ -256,8 +266,10 @@ async function advanceGame() {
           pendingSettlement[String(roundNumber)] = {
             roundNumber,
             winningIndex: winner,
-            bets: activeBets,
-            settled: false
+            completedAt: now,
+            payoutVersion: 1,
+            settled: false,
+            bets: activeBets
           };
         }
 
@@ -280,10 +292,7 @@ async function advanceGame() {
 
     const saved = tx.snapshot.val();
 
-    if (!validGame(saved)) {
-      console.error("GAME UPDATE INVALID");
-      return;
-    }
+    if (!validGame(saved)) return;
 
     const previousRound = game
       ? game.roundNumber
@@ -292,24 +301,15 @@ async function advanceGame() {
     game = saved;
     lastSync = Date.now();
 
-    if (tx.committed) {
-      console.log(
-        "GAME UPDATED:",
-        game.roundNumber
-      );
-    }
-
     if (
       previousRound !== null &&
       game.roundNumber > previousRound
     ) {
-      const completedRound =
-        game.roundNumber - 1;
+      const finishedRound = game.roundNumber - 1;
 
       const result = historyArray(game.history)
         .find(
-          item =>
-            item.roundNumber === completedRound
+          item => item.roundNumber === finishedRound
         );
 
       if (result) {
@@ -319,34 +319,409 @@ async function advanceGame() {
         );
       }
 
-      console.log(
-        "ROUND FINISHED:",
-        completedRound
-      );
+      console.log("ROUND FINISHED:", finishedRound);
     }
 
     sendState();
     sendClock();
   } catch (error) {
-    console.error(
-      "GAME UPDATE ERROR:",
-      error.message
-    );
+    console.error("ROUND ERROR:", error.message);
   } finally {
-    processing = false;
+    roundProcessing = false;
   }
 }
 
-// Independent clock:
-// Firebase requests cannot block the timer events.
+/*
+  BETTING
+
+  Firebase ID token identifies the user.
+
+  A root transaction atomically records the bet
+  and subtracts coins.
+
+  This transaction runs only when a user bets,
+  never every second.
+*/
+
+async function placeBet(data) {
+  if (!BETTING_ENABLED) {
+    return {
+      ok: false,
+      error: "BETTING_DISABLED",
+      message: "الرهانات مغلقة"
+    };
+  }
+
+  if (!firebaseReady || !game) {
+    return {
+      ok: false,
+      error: "SERVER_NOT_READY"
+    };
+  }
+
+  const token = String(data?.idToken || "");
+  const betId = String(data?.betId || "");
+
+  const foodIndex = Number(data?.foodIndex);
+  const amount = Number(data?.amount);
+  const roundNumber = Number(data?.roundNumber);
+
+  if (
+    !/^[a-f0-9]{32}$/i.test(betId) ||
+    !Number.isInteger(foodIndex) ||
+    foodIndex < 0 ||
+    foodIndex > 7 ||
+    !CHIPS.includes(amount) ||
+    !Number.isSafeInteger(roundNumber)
+  ) {
+    return {
+      ok: false,
+      error: "INVALID_BET"
+    };
+  }
+
+  let decoded;
+
+  try {
+    decoded = await admin.auth().verifyIdToken(token);
+  } catch (error) {
+    return {
+      ok: false,
+      error: "INVALID_TOKEN"
+    };
+  }
+
+  const uid = decoded.uid;
+
+  const betKey = `${uid}_${betId}`;
+
+  let rejection = "BET_REJECTED";
+
+  try {
+    const tx = await admin.database().ref()
+      .transaction(
+        root => {
+          if (!root) {
+            rejection = "DATABASE_EMPTY";
+            return;
+          }
+
+          const current = root[GAME_PATH];
+
+          if (!validGame(current)) {
+            rejection = "GAME_NOT_READY";
+            return;
+          }
+
+          if (
+            current.roundNumber !== roundNumber ||
+            Date.now() >= Number(current.roundEndsAt)
+          ) {
+            rejection = "ROUND_CLOSED";
+            return;
+          }
+
+          const users = root.Users || {};
+          const user = users[uid];
+
+          if (!user) {
+            rejection = "USER_NOT_FOUND";
+            return;
+          }
+
+          const coins = Number(user.coins);
+
+          if (
+            !Number.isSafeInteger(coins) ||
+            coins < amount
+          ) {
+            rejection = "INSUFFICIENT_COINS";
+            return;
+          }
+
+          const activeBets = {
+            ...(current.activeBets || {})
+          };
+
+          if (activeBets[betKey]) {
+            rejection = "DUPLICATE_BET";
+            return;
+          }
+
+          const selected = new Set();
+
+          for (const bet of Object.values(activeBets)) {
+            if (bet.uid === uid) {
+              selected.add(Number(bet.foodIndex));
+            }
+          }
+
+          if (
+            !selected.has(foodIndex) &&
+            selected.size >= 6
+          ) {
+            rejection = "MAX_SIX_SLOTS";
+            return;
+          }
+
+          activeBets[betKey] = {
+            uid,
+            betId,
+            foodIndex,
+            amount,
+            roundNumber,
+            createdAt: Date.now()
+          };
+
+          root.Users[uid].coins = coins - amount;
+
+          root[GAME_PATH] = {
+            ...current,
+            activeBets
+          };
+
+          return root;
+        },
+        undefined,
+        false
+      );
+
+    if (!tx.committed) {
+      return {
+        ok: false,
+        error: rejection
+      };
+    }
+
+    const savedRoot = tx.snapshot.val();
+
+    if (
+      savedRoot &&
+      validGame(savedRoot[GAME_PATH])
+    ) {
+      game = savedRoot[GAME_PATH];
+      lastSync = Date.now();
+    }
+
+    console.log(
+      "BET ACCEPTED:",
+      uid,
+      amount,
+      foodIndex
+    );
+
+    return {
+      ok: true,
+      betId,
+      foodIndex,
+      amount,
+      roundNumber,
+      balance: Number(
+        savedRoot?.Users?.[uid]?.coins
+      )
+    };
+  } catch (error) {
+    console.error("BET ERROR:", error.message);
+
+    return {
+      ok: false,
+      error: "BET_FAILED"
+    };
+  }
+}
+
+/*
+  PAYOUT ENGINE
+
+  Each winning user's total payout is credited
+  using a transaction on Users/{uid}.
+
+  lionPayouts/{roundNumber} records completed
+  payouts inside that same transaction.
+
+  Repeating a settlement therefore does not
+  credit the same user twice.
+*/
+
+function calculatePayouts(entry) {
+  const totals = {};
+
+  const winner = Number(entry.winningIndex);
+
+  for (const bet of Object.values(entry.bets || {})) {
+    const uid = bet.uid;
+    const index = Number(bet.foodIndex);
+    const amount = Number(bet.amount);
+
+    if (
+      typeof uid !== "string" ||
+      !uid ||
+      index !== winner ||
+      !Number.isSafeInteger(amount) ||
+      amount <= 0
+    ) {
+      continue;
+    }
+
+    const payout = amount * MULTIPLIERS[index];
+
+    if (!Number.isSafeInteger(payout)) continue;
+
+    totals[uid] = (totals[uid] || 0) + payout;
+  }
+
+  return totals;
+}
+
+async function creditWinner(uid, roundNumber, amount) {
+  const ref = admin.database().ref(`Users/${uid}`);
+
+  const key = String(roundNumber);
+
+  const tx = await ref.transaction(
+    user => {
+      if (!user) return;
+
+      const payouts = user.lionPayouts || {};
+
+      if (payouts[key]) {
+        return;
+      }
+
+      const coins = Number(user.coins);
+
+      if (
+        !Number.isSafeInteger(coins) ||
+        coins < 0 ||
+        !Number.isSafeInteger(amount) ||
+        amount <= 0 ||
+        !Number.isSafeInteger(coins + amount)
+      ) {
+        return;
+      }
+
+      return {
+        ...user,
+        coins: coins + amount,
+        lionPayouts: {
+          ...payouts,
+          [key]: {
+            amount,
+            completedAt: Date.now()
+          }
+        }
+      };
+    },
+    undefined,
+    false
+  );
+
+  if (tx.committed) return true;
+
+  const saved = tx.snapshot.val();
+
+  return Boolean(
+    saved &&
+    saved.lionPayouts &&
+    saved.lionPayouts[key]
+  );
+}
+
+async function settlePending() {
+  if (
+    !firebaseReady ||
+    settlementProcessing ||
+    !game
+  ) {
+    return;
+  }
+
+  settlementProcessing = true;
+
+  try {
+    const snapshot = await gameRef()
+      .child("pendingSettlement")
+      .once("value");
+
+    const pending = snapshot.val() || {};
+
+    for (const [roundKey, entry] of Object.entries(pending)) {
+      if (!entry || entry.settled) continue;
+
+      // Do not automatically settle old records from
+      // previous server versions.
+      if (entry.payoutVersion !== 1) continue;
+
+      const totals = calculatePayouts(entry);
+
+      let allPaid = true;
+
+      for (const [uid, amount] of Object.entries(totals)) {
+        try {
+          const paid = await creditWinner(
+            uid,
+            entry.roundNumber,
+            amount
+          );
+
+          if (!paid) {
+            allPaid = false;
+            console.error(
+              "PAYOUT PENDING:",
+              uid,
+              roundKey
+            );
+          }
+        } catch (error) {
+          allPaid = false;
+
+          console.error(
+            "PAYOUT ERROR:",
+            error.message
+          );
+        }
+      }
+
+      if (!allPaid) continue;
+
+      const settlementRef = gameRef()
+        .child("pendingSettlement")
+        .child(roundKey);
+
+      await settlementRef.child("settled")
+        .set(true);
+
+      await settlementRef.child("settledAt")
+        .set(Date.now());
+
+      console.log("ROUND SETTLED:", roundKey);
+    }
+  } catch (error) {
+    console.error(
+      "SETTLEMENT ERROR:",
+      error.message
+    );
+  } finally {
+    settlementProcessing = false;
+  }
+}
+
+/*
+  TIMER
+
+  Clock events are sent independently.
+
+  The settlement engine runs separately.
+*/
+
 setInterval(() => {
   sendClock();
 
   if (!firebaseReady) return;
 
   if (!game) {
-    if (!processing) {
-      advanceGame().catch(console.error);
+    if (!loadProcessing) {
+      loadGame().catch(console.error);
     }
     return;
   }
@@ -362,19 +737,26 @@ setInterval(() => {
     duration !== ROUND_MS ||
     Number(game.roundStartsAt) > now + ROUND_MS;
 
-  // Also refresh periodically so the server can
-  // recover from state changes or another instance.
   const needsSync = now - lastSync >= 10000;
 
   if (
     (needsUpdate || needsSync) &&
-    !processing
+    !roundProcessing
   ) {
     advanceGame().catch(console.error);
   }
 }, 1000);
 
-// Existing voice chat events remain unchanged.
+setInterval(() => {
+  if (!settlementProcessing) {
+    settlePending().catch(console.error);
+  }
+}, 5000);
+
+/*
+  SOCKET.IO
+*/
+
 io.on("connection", socket => {
   console.log("USER CONNECTED:", socket.id);
 
@@ -489,13 +871,25 @@ io.on("connection", socket => {
 
   socket.on(
     "greedy_lion_place_bet",
-    (data, ack) => {
-      if (typeof ack === "function") {
-        ack({
+    async (data, ack) => {
+      const reply =
+        typeof ack === "function"
+          ? ack
+          : () => {};
+
+      try {
+        const result = await placeBet(data);
+
+        reply(result);
+      } catch (error) {
+        console.error(
+          "SOCKET BET ERROR:",
+          error.message
+        );
+
+        reply({
           ok: false,
-          error: "BETTING_DISABLED",
-          message:
-            "الرهانات مغلقة مؤقتًا أثناء إصلاح الجولات"
+          error: "SERVER_ERROR"
         });
       }
     }
@@ -513,6 +907,10 @@ io.on("connection", socket => {
   });
 });
 
+/*
+  HEALTH CHECK
+*/
+
 app.get("/", (req, res) => {
   const history = game
     ? historyArray(game.history)
@@ -523,7 +921,7 @@ app.get("/", (req, res) => {
     game: "Greedy Lion",
     status: "online",
     firebaseReady,
-    bettingEnabled: false,
+    bettingEnabled: BETTING_ENABLED,
     roundNumber: game
       ? game.roundNumber
       : null,
@@ -548,6 +946,11 @@ server.listen(PORT, async () => {
   console.log(
     "MAX CHAT SERVER RUNNING:",
     PORT
+  );
+
+  console.log(
+    "BETTING ENABLED:",
+    BETTING_ENABLED
   );
 
   await loadGame();
