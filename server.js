@@ -44,6 +44,7 @@ const io = new Server(server, {
 const GAME_ROOM = 'maxchat_greedy_lion_global';
 const ROUND_MS = 25_000;
 const FOOD_COUNT = 8;
+const FOOD_MULTIPLIERS = [45, 5, 5, 10, 15, 5, 5, 25];
 
 let roundNumber = 1;
 let roundStartsAt = Date.now();
