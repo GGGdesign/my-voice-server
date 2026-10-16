@@ -30,16 +30,13 @@ const FOOD_MULTIPLIERS = [
   45, 5, 5, 10, 15, 5, 5, 25
 ];
 
-const ALLOWED_CHIPS = [
-  100, 500, 1000, 5000, 10000
-];
-
-// Security lock: real betting remains disabled.
+// Real wallet betting remains disabled.
 const BETTING_ENABLED = false;
 
 let firebaseReady = false;
 let gameState = null;
 let processingRound = false;
+let clockBusy = false;
 
 try {
   if (fs.existsSync(SECRET_PATH)) {
@@ -68,7 +65,7 @@ function database() {
   return admin.database();
 }
 
-function makeInitialState() {
+function initialState() {
   const now = Date.now();
 
   return {
@@ -79,8 +76,17 @@ function makeInitialState() {
   };
 }
 
-function publicGameState() {
-  const state = gameState || makeInitialState();
+function validState(value) {
+  return value &&
+    Number.isSafeInteger(value.roundNumber) &&
+    value.roundNumber >= 1 &&
+    Number.isFinite(value.roundEndsAt) &&
+    Number.isFinite(value.roundStartsAt) &&
+    Array.isArray(value.history);
+}
+
+function publicState() {
+  const state = gameState || initialState();
 
   return {
     roundNumber: state.roundNumber,
@@ -89,38 +95,85 @@ function publicGameState() {
     serverTime: Date.now(),
     phase: "betting_disabled",
     bettingEnabled: false,
-    history: (state.history || []).slice(-8),
+    history: state.history.slice(-8),
     multipliers: FOOD_MULTIPLIERS
   };
 }
 
+function broadcastState() {
+  if (!gameState) return;
+
+  io.to(GAME_ROOM).emit(
+    "greedy_lion_state",
+    publicState()
+  );
+}
+
+function broadcastClock() {
+  if (!gameState) return;
+
+  io.to(GAME_ROOM).emit(
+    "greedy_lion_clock",
+    {
+      roundNumber: gameState.roundNumber,
+      roundEndsAt: gameState.roundEndsAt,
+      serverTime: Date.now()
+    }
+  );
+}
+
 async function initializeGame() {
   if (!firebaseReady) {
-    gameState = makeInitialState();
-    console.warn(
-      "Game running without Firebase persistence"
+    console.error(
+      "Game paused: Firebase unavailable"
     );
     return;
   }
 
   const ref = database().ref(GAME_PATH);
 
-  const transaction = await ref.transaction(
-    current => current || makeInitialState(),
+  const tx = await ref.transaction(
+    current => {
+      if (validState(current)) {
+        return;
+      }
+
+      if (current === null) {
+        return initialState();
+      }
+
+      console.error(
+        "Invalid existing game data. Manual review required."
+      );
+
+      return;
+    },
     undefined,
     false
   );
 
-  gameState = transaction.snapshot.val();
+  const loaded = tx.snapshot.val();
+
+  if (!validState(loaded)) {
+    throw new Error("Invalid game state in Firebase");
+  }
+
+  gameState = loaded;
 
   console.log(
     "Greedy Lion loaded. Round:",
     gameState.roundNumber
   );
+
+  broadcastState();
 }
 
 async function finishRound() {
-  if (processingRound || !gameState) {
+  if (
+    processingRound ||
+    !firebaseReady ||
+    !gameState
+  ) {
     return;
   }
 
@@ -131,76 +184,57 @@ async function finishRound() {
   processingRound = true;
 
   try {
-    if (!firebaseReady) {
-      const oldRound = gameState.roundNumber;
-      const winner = crypto.randomInt(8);
-      const now = Date.now();
+    const ref = database().ref(GAME_PATH);
 
-      const result = {
-        roundNumber: oldRound,
-        winningIndex: winner,
-        completedAt: now,
-        hasSettledBets: false
-      };
+    // Refresh before attempting a round transition.
+    const snapshot = await ref.once("value");
+    const latest = snapshot.val();
 
-      gameState.history = [
-        ...(gameState.history || []),
-        result
-      ].slice(-8);
-
-      gameState.roundNumber++;
-      gameState.roundStartsAt = now;
-      gameState.roundEndsAt = now + ROUND_MS;
-
-      io.to(GAME_ROOM).emit(
-        "greedy_lion_round_result",
-        result
+    if (!validState(latest)) {
+      throw new Error(
+        "Game state missing or invalid"
       );
+    }
 
-      io.to(GAME_ROOM).emit(
-        "greedy_lion_state",
-        publicGameState()
-      );
+    gameState = latest;
 
+    if (Date.now() < latest.roundEndsAt) {
       return;
     }
 
-    const ref = database().ref(GAME_PATH);
+    const oldRound = latest.roundNumber;
+    const winner = crypto.randomInt(8);
 
-    const result = await ref.transaction(
+    const tx = await ref.transaction(
       current => {
-        if (!current) {
+        if (!validState(current)) {
           return;
         }
 
-        if (Date.now() < current.roundEndsAt) {
+        if (
+          current.roundNumber !== oldRound ||
+          Date.now() < current.roundEndsAt
+        ) {
           return;
         }
 
-        const completedRound =
-          current.roundNumber;
-
-        const winner = crypto.randomInt(8);
         const now = Date.now();
 
-        const roundResult = {
-          roundNumber: completedRound,
+        const result = {
+          roundNumber: oldRound,
           winningIndex: winner,
           completedAt: now,
           hasSettledBets: false
         };
 
         current.history = [
-          ...(current.history || []),
-          roundResult
+          ...current.history,
+          result
         ].slice(-8);
 
-        current.roundNumber =
-          completedRound + 1;
-
+        current.roundNumber = oldRound + 1;
         current.roundStartsAt = now;
-        current.roundEndsAt =
-          now + ROUND_MS;
+        current.roundEndsAt = now + ROUND_MS;
 
         return current;
       },
@@ -208,27 +242,49 @@ async function finishRound() {
       false
     );
 
-    gameState = result.snapshot.val();
+    const saved = tx.snapshot.val();
 
-    if (result.committed && gameState) {
-      const latest =
-        gameState.history[
-          gameState.history.length - 1
-        ];
-
-      io.to(GAME_ROOM).emit(
-        "greedy_lion_round_result",
-        latest
-      );
-
-      io.to(GAME_ROOM).emit(
-        "greedy_lion_state",
-        publicGameState()
+    if (!validState(saved)) {
+      throw new Error(
+        "Round transaction returned invalid state"
       );
     }
+
+    gameState = saved;
+
+    if (tx.committed) {
+      const result = saved.history.find(
+        item => item.roundNumber === oldRound
+      );
+
+      if (result) {
+        console.log(
+          "ROUND FINISHED:",
+          oldRound,
+          "WINNER:",
+          result.winningIndex
+        );
+
+        io.to(GAME_ROOM).emit(
+          "greedy_lion_round_result",
+          result
+        );
+      }
+
+      console.log(
+        "ROUND STARTED:",
+        saved.roundNumber,
+        "ENDS:",
+        new Date(saved.roundEndsAt).toISOString()
+      );
+    }
+
+    broadcastState();
+    broadcastClock();
+
   } catch (error) {
     console.error(
-      "Round completion failed:",
+      "ROUND ERROR:",
       error.message
     );
   } finally {
@@ -236,239 +292,162 @@ async function finishRound() {
   }
 }
 
-async function refreshGame() {
-  try {
-    if (firebaseReady) {
-      const snapshot = await database()
-        .ref(GAME_PATH)
-        .once("value");
-
-      if (snapshot.exists()) {
-        gameState = snapshot.val();
-      }
-    }
-
-    await finishRound();
-
-    if (gameState) {
-      io.to(GAME_ROOM).emit(
-        "greedy_lion_clock",
-        {
-          roundNumber:
-            gameState.roundNumber,
-          roundEndsAt:
-            gameState.roundEndsAt,
-          serverTime: Date.now()
-        }
-      );
-    }
-  } catch (error) {
-    console.error(
-      "Game clock error:",
-      error.message
-    );
-  }
-}
-
-let clockBusy = false;
-
-setInterval(async () => {
-  if (clockBusy) {
+async function gameTick() {
+  if (clockBusy || !gameState) {
     return;
   }
 
   clockBusy = true;
 
   try {
-    await refreshGame();
+    // Keep the visible timer moving even while
+    // Firebase round completion is being processed.
+    broadcastClock();
+
+    if (Date.now() >= gameState.roundEndsAt) {
+      await finishRound();
+    }
   } finally {
     clockBusy = false;
   }
+}
+
+setInterval(() => {
+  gameTick().catch(error => {
+    console.error(
+      "GAME TICK ERROR:",
+      error.message
+    );
+  });
 }, 1000);
 
 io.on("connection", socket => {
-  console.log(
-    "User connected:",
-    socket.id
-  );
+  console.log("User connected:", socket.id);
 
   // Existing voice chat events
 
   socket.on("join_room", data => {
     if (!data || !data.roomId) return;
 
-    const {
-      roomId,
-      userId,
-      userName
-    } = data;
+    const { roomId, userId, userName } = data;
 
     socket.join(roomId);
 
     socket.to(roomId).emit(
       "user_joined_room",
-      {
-        userId,
-        userName
-      }
+      { userId, userName }
     );
   });
 
   socket.on("toggle_mute", data => {
     if (!data || !data.roomId) return;
 
-    const {
-      roomId,
-      userId,
-      isMuted
-    } = data;
+    const { roomId, userId, isMuted } = data;
 
     io.to(roomId).emit(
       "user_toggle_mute",
-      {
-        userId,
-        isMuted
-      }
+      { userId, isMuted }
     );
   });
 
   socket.on("sit_on_seat", data => {
     if (!data || !data.roomId) return;
 
-    const {
-      roomId,
-      userId,
-      seatIndex
-    } = data;
+    const { roomId, userId, seatIndex } = data;
 
     io.to(roomId).emit(
       "user_sat_on_seat",
-      {
-        userId,
-        seatIndex
-      }
+      { userId, seatIndex }
     );
   });
 
   socket.on("leave_seat", data => {
     if (!data || !data.roomId) return;
 
-    const {
-      roomId,
-      userId
-    } = data;
+    const { roomId, userId } = data;
 
     io.to(roomId).emit(
       "user_left_seat",
-      {
-        userId
-      }
+      { userId }
     );
   });
 
   socket.on("start_audio_stream", data => {
     if (!data || !data.roomId) return;
 
-    const {
-      roomId,
-      userId
-    } = data;
+    const { roomId, userId } = data;
 
     socket.to(roomId).emit(
       "user_started_audio",
-      {
-        userId
-      }
+      { userId }
     );
   });
 
   socket.on("stop_audio_stream", data => {
     if (!data || !data.roomId) return;
 
-    const {
-      roomId,
-      userId
-    } = data;
+    const { roomId, userId } = data;
 
     socket.to(roomId).emit(
       "user_stopped_audio",
-      {
-        userId
-      }
+      { userId }
     );
   });
 
   socket.on("voice_data", data => {
     if (!data || !data.roomId) return;
 
-    const {
-      roomId,
-      audioBuffer,
-      userId
-    } = data;
+    const { roomId, audioBuffer, userId } = data;
 
     socket.to(roomId).emit(
       "voice_data",
-      {
-        audioBuffer,
-        userId
-      }
+      { roomId, audioBuffer, userId }
     );
   });
 
-  // Greedy Lion events
+  // Greedy Lion
 
   socket.on("greedy_lion_join", async () => {
     socket.join(GAME_ROOM);
 
-    if (firebaseReady) {
-      try {
+    try {
+      if (firebaseReady) {
         const snapshot = await database()
           .ref(GAME_PATH)
           .once("value");
 
-        if (snapshot.exists()) {
-          gameState = snapshot.val();
+        const latest = snapshot.val();
+
+        if (validState(latest)) {
+          gameState = latest;
         }
-      } catch (error) {
-        console.error(
-          "Join sync failed:",
-          error.message
+      }
+
+      if (gameState) {
+        socket.emit(
+          "greedy_lion_state",
+          publicState()
         );
       }
+    } catch (error) {
+      console.error(
+        "JOIN ERROR:",
+        error.message
+      );
     }
-
-    socket.emit(
-      "greedy_lion_state",
-      publicGameState()
-    );
   });
 
   socket.on(
     "greedy_lion_place_bet",
-    async (data, ack) => {
-      const reply =
-        typeof ack === "function"
-          ? ack
-          : () => {};
-
-      if (!BETTING_ENABLED) {
-        reply({
+    (data, ack) => {
+      if (typeof ack === "function") {
+        ack({
           ok: false,
           error: "BETTING_DISABLED",
           message:
             "الرهانات مغلقة مؤقتًا لحماية الرصيد"
         });
-        return;
       }
-
-      // Do not debit any wallet until the
-      // authenticated settlement system
-      // has passed integration testing.
-      reply({
-        ok: false,
-        error: "BETTING_NOT_READY"
-      });
     }
   );
 
@@ -490,7 +469,18 @@ app.get("/", (req, res) => {
     game: "Greedy Lion",
     status: "online",
     firebaseReady,
-    bettingEnabled: false
+    bettingEnabled: BETTING_ENABLED,
+    roundNumber: gameState?.roundNumber ?? null,
+    secondsRemaining: gameState
+      ? Math.max(
+          0,
+          Math.ceil(
+            (gameState.roundEndsAt - Date.now()) / 1000
+          )
+        )
+      : null,
+    lastResult:
+      gameState?.history?.slice(-1)[0] ?? null
   });
 });
 
@@ -506,7 +496,7 @@ server.listen(PORT, async () => {
     await initializeGame();
   } catch (error) {
     console.error(
-      "Startup error:",
+      "GAME STARTUP ERROR:",
       error.message
     );
   }
