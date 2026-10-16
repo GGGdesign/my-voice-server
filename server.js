@@ -30,13 +30,17 @@ const FOOD_MULTIPLIERS = [
   45, 5, 5, 10, 15, 5, 5, 25
 ];
 
-// Real wallet betting remains disabled.
+// Keep real wallet betting disabled.
 const BETTING_ENABLED = false;
 
 let firebaseReady = false;
 let gameState = null;
 let processingRound = false;
 let clockBusy = false;
+
+// ---------------------------------------
+// Firebase Admin
+// ---------------------------------------
 
 try {
   if (fs.existsSync(SECRET_PATH)) {
@@ -65,6 +69,10 @@ function database() {
   return admin.database();
 }
 
+// ---------------------------------------
+// Game state
+// ---------------------------------------
+
 function initialState() {
   const now = Date.now();
 
@@ -76,41 +84,68 @@ function initialState() {
   };
 }
 
+// FIX:
+// Firebase removes empty arrays.
+// Missing history is a valid empty history.
 function validState(value) {
-  return value &&
+  return (
+    value !== null &&
+    typeof value === "object" &&
     Number.isSafeInteger(value.roundNumber) &&
     value.roundNumber >= 1 &&
-    Number.isFinite(value.roundEndsAt) &&
     Number.isFinite(value.roundStartsAt) &&
-    Array.isArray(value.history);
+    Number.isFinite(value.roundEndsAt) &&
+    value.roundEndsAt > value.roundStartsAt &&
+    (
+      value.history === undefined ||
+      value.history === null ||
+      Array.isArray(value.history)
+    )
+  );
+}
+
+function getHistory(state) {
+  if (!state || !Array.isArray(state.history)) {
+    return [];
+  }
+
+  return state.history;
 }
 
 function publicState() {
-  const state = gameState || initialState();
+  if (!gameState) {
+    return null;
+  }
 
   return {
-    roundNumber: state.roundNumber,
-    roundStartsAt: state.roundStartsAt,
-    roundEndsAt: state.roundEndsAt,
+    roundNumber: gameState.roundNumber,
+    roundStartsAt: gameState.roundStartsAt,
+    roundEndsAt: gameState.roundEndsAt,
     serverTime: Date.now(),
     phase: "betting_disabled",
-    bettingEnabled: false,
-    history: state.history.slice(-8),
+    bettingEnabled: BETTING_ENABLED,
+    history: getHistory(gameState).slice(-8),
     multipliers: FOOD_MULTIPLIERS
   };
 }
 
 function broadcastState() {
-  if (!gameState) return;
+  const state = publicState();
+
+  if (!state) {
+    return;
+  }
 
   io.to(GAME_ROOM).emit(
     "greedy_lion_state",
-    publicState()
+    state
   );
 }
 
 function broadcastClock() {
-  if (!gameState) return;
+  if (!gameState) {
+    return;
+  }
 
   io.to(GAME_ROOM).emit(
     "greedy_lion_clock",
@@ -121,6 +156,10 @@ function broadcastClock() {
     }
   );
 }
+
+// ---------------------------------------
+// Initialize saved game
+// ---------------------------------------
 
 async function initializeGame() {
   if (!firebaseReady) {
@@ -142,8 +181,9 @@ async function initializeGame() {
         return initialState();
       }
 
+      // Never erase unknown existing data.
       console.error(
-        "Invalid existing game data. Manual review required."
+        "Invalid game data. No data deleted."
       );
 
       return;
@@ -155,7 +195,9 @@ async function initializeGame() {
   const loaded = tx.snapshot.val();
 
   if (!validState(loaded)) {
-    throw new Error("Invalid game state in Firebase");
+    throw new Error(
+      "Invalid game state in Firebase"
+    );
   }
 
   gameState = loaded;
@@ -165,8 +207,23 @@ async function initializeGame() {
     gameState.roundNumber
   );
 
+  console.log(
+    "ROUND STARTED:",
+    gameState.roundNumber
+  );
+
   broadcastState();
+  broadcastClock();
+
+  // Handle an expired round from before restart.
+  if (Date.now() >= gameState.roundEndsAt) {
+    await finishRound();
+  }
 }
+
+// ---------------------------------------
+// Complete round
+// ---------------------------------------
 
 async function finishRound() {
   if (
@@ -186,23 +243,25 @@ async function finishRound() {
   try {
     const ref = database().ref(GAME_PATH);
 
-    // Refresh before attempting a round transition.
     const snapshot = await ref.once("value");
     const latest = snapshot.val();
 
     if (!validState(latest)) {
       throw new Error(
-        "Game state missing or invalid"
+        "Invalid game state during round"
       );
     }
 
     gameState = latest;
 
     if (Date.now() < latest.roundEndsAt) {
+      broadcastState();
       return;
     }
 
     const oldRound = latest.roundNumber;
+
+    // Choose once for this transition.
     const winner = crypto.randomInt(8);
 
     const tx = await ref.transaction(
@@ -220,21 +279,27 @@ async function finishRound() {
 
         const now = Date.now();
 
-        const result = {
+        const roundResult = {
           roundNumber: oldRound,
           winningIndex: winner,
           completedAt: now,
           hasSettledBets: false
         };
 
+        const previousHistory =
+          getHistory(current);
+
         current.history = [
-          ...current.history,
-          result
+          ...previousHistory,
+          roundResult
         ].slice(-8);
 
-        current.roundNumber = oldRound + 1;
+        current.roundNumber =
+          oldRound + 1;
+
         current.roundStartsAt = now;
-        current.roundEndsAt = now + ROUND_MS;
+        current.roundEndsAt =
+          now + ROUND_MS;
 
         return current;
       },
@@ -246,14 +311,14 @@ async function finishRound() {
 
     if (!validState(saved)) {
       throw new Error(
-        "Round transaction returned invalid state"
+        "Invalid saved game state"
       );
     }
 
     gameState = saved;
 
     if (tx.committed) {
-      const result = saved.history.find(
+      const result = getHistory(saved).find(
         item => item.roundNumber === oldRound
       );
 
@@ -273,9 +338,7 @@ async function finishRound() {
 
       console.log(
         "ROUND STARTED:",
-        saved.roundNumber,
-        "ENDS:",
-        new Date(saved.roundEndsAt).toISOString()
+        saved.roundNumber
       );
     }
 
@@ -292,6 +355,10 @@ async function finishRound() {
   }
 }
 
+// ---------------------------------------
+// Clock - every second
+// ---------------------------------------
+
 async function gameTick() {
   if (clockBusy || !gameState) {
     return;
@@ -300,8 +367,6 @@ async function gameTick() {
   clockBusy = true;
 
   try {
-    // Keep the visible timer moving even while
-    // Firebase round completion is being processed.
     broadcastClock();
 
     if (Date.now() >= gameState.roundEndsAt) {
@@ -321,91 +386,144 @@ setInterval(() => {
   });
 }, 1000);
 
+// ---------------------------------------
+// Socket.IO
+// ---------------------------------------
+
 io.on("connection", socket => {
-  console.log("User connected:", socket.id);
+  console.log(
+    "User connected:",
+    socket.id
+  );
 
   // Existing voice chat events
 
   socket.on("join_room", data => {
     if (!data || !data.roomId) return;
 
-    const { roomId, userId, userName } = data;
+    const {
+      roomId,
+      userId,
+      userName
+    } = data;
 
     socket.join(roomId);
 
     socket.to(roomId).emit(
       "user_joined_room",
-      { userId, userName }
+      {
+        userId,
+        userName
+      }
     );
   });
 
   socket.on("toggle_mute", data => {
     if (!data || !data.roomId) return;
 
-    const { roomId, userId, isMuted } = data;
+    const {
+      roomId,
+      userId,
+      isMuted
+    } = data;
 
     io.to(roomId).emit(
       "user_toggle_mute",
-      { userId, isMuted }
+      {
+        userId,
+        isMuted
+      }
     );
   });
 
   socket.on("sit_on_seat", data => {
     if (!data || !data.roomId) return;
 
-    const { roomId, userId, seatIndex } = data;
+    const {
+      roomId,
+      userId,
+      seatIndex
+    } = data;
 
     io.to(roomId).emit(
       "user_sat_on_seat",
-      { userId, seatIndex }
+      {
+        userId,
+        seatIndex
+      }
     );
   });
 
   socket.on("leave_seat", data => {
     if (!data || !data.roomId) return;
 
-    const { roomId, userId } = data;
+    const {
+      roomId,
+      userId
+    } = data;
 
     io.to(roomId).emit(
       "user_left_seat",
-      { userId }
+      {
+        userId
+      }
     );
   });
 
   socket.on("start_audio_stream", data => {
     if (!data || !data.roomId) return;
 
-    const { roomId, userId } = data;
+    const {
+      roomId,
+      userId
+    } = data;
 
     socket.to(roomId).emit(
       "user_started_audio",
-      { userId }
+      {
+        userId
+      }
     );
   });
 
   socket.on("stop_audio_stream", data => {
     if (!data || !data.roomId) return;
 
-    const { roomId, userId } = data;
+    const {
+      roomId,
+      userId
+    } = data;
 
     socket.to(roomId).emit(
       "user_stopped_audio",
-      { userId }
+      {
+        userId
+      }
     );
   });
 
   socket.on("voice_data", data => {
     if (!data || !data.roomId) return;
 
-    const { roomId, audioBuffer, userId } = data;
+    const {
+      roomId,
+      audioBuffer,
+      userId
+    } = data;
 
     socket.to(roomId).emit(
       "voice_data",
-      { roomId, audioBuffer, userId }
+      {
+        roomId,
+        audioBuffer,
+        userId
+      }
     );
   });
 
-  // Greedy Lion
+  // -------------------------------------
+  // Greedy Lion events
+  // -------------------------------------
 
   socket.on("greedy_lion_join", async () => {
     socket.join(GAME_ROOM);
@@ -428,6 +546,15 @@ io.on("connection", socket => {
           "greedy_lion_state",
           publicState()
         );
+
+        socket.emit(
+          "greedy_lion_clock",
+          {
+            roundNumber: gameState.roundNumber,
+            roundEndsAt: gameState.roundEndsAt,
+            serverTime: Date.now()
+          }
+        );
       }
     } catch (error) {
       console.error(
@@ -437,6 +564,7 @@ io.on("connection", socket => {
     }
   });
 
+  // Betting stays locked.
   socket.on(
     "greedy_lion_place_bet",
     (data, ack) => {
@@ -463,6 +591,10 @@ io.on("connection", socket => {
   });
 });
 
+// ---------------------------------------
+// Health check
+// ---------------------------------------
+
 app.get("/", (req, res) => {
   res.json({
     app: "Max Chat",
@@ -470,19 +602,28 @@ app.get("/", (req, res) => {
     status: "online",
     firebaseReady,
     bettingEnabled: BETTING_ENABLED,
-    roundNumber: gameState?.roundNumber ?? null,
+    roundNumber:
+      gameState?.roundNumber ?? null,
     secondsRemaining: gameState
       ? Math.max(
           0,
           Math.ceil(
-            (gameState.roundEndsAt - Date.now()) / 1000
+            (
+              gameState.roundEndsAt -
+              Date.now()
+            ) / 1000
           )
         )
       : null,
     lastResult:
-      gameState?.history?.slice(-1)[0] ?? null
+      getHistory(gameState).slice(-1)[0] ??
+      null
   });
 });
+
+// ---------------------------------------
+// Start server
+// ---------------------------------------
 
 const PORT = process.env.PORT || 10000;
 
