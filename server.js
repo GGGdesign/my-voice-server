@@ -34,6 +34,7 @@ const BETTING_ENABLED =
   process.env.LION_ENABLE_BETS === "true";
 
 const OFFICIAL_OWNER_ID = "779157";
+const ID_REGISTRY_PATH = "maxChatIdRegistry";
 
 let firebaseReady = false;
 let game = null;
@@ -41,6 +42,9 @@ let roundProcessing = false;
 let settlementProcessing = false;
 let loading = false;
 let lastSync = 0;
+
+let registryReady = false;
+let registryInitPromise = null;
 
 try {
   const credentials = JSON.parse(
@@ -61,16 +65,20 @@ try {
 const db = () => admin.database();
 const gameRef = () => db().ref(GAME_PATH);
 const userRef = uid => db().ref(`Users/${uid}`);
+const registryRef = () => db().ref(ID_REGISTRY_PATH);
 
 /*
-  SECURE USER REGISTRATION
+  MAX CHAT USER REGISTRATION
 
-  - Verify Firebase Authentication token.
-  - Preserve existing users without changes.
-  - Check all existing public IDs.
-  - Create new user in a Users transaction.
-  - Never allocate official owner ID.
-  - Never modify existing wallets or roles.
+  - Firebase token verification.
+  - Existing users are never modified.
+  - New IDs are reserved in a separate registry.
+  - No transaction on the full Users tree.
+  - New profiles are created at Users/{uid}.
+  - Existing wallets and roles remain untouched.
+
+  All new public IDs must be created through
+  this server to preserve uniqueness.
 */
 
 async function verifyRequestUser(req) {
@@ -105,27 +113,37 @@ function normalizePublicId(value) {
   return /^[0-9]+$/.test(id) ? id : "";
 }
 
-function chooseUnusedPublicId(users) {
-  const used = new Set([OFFICIAL_OWNER_ID]);
+function collectExistingIds(users) {
+  const used = {
+    [OFFICIAL_OWNER_ID]: "__reserved_owner__"
+  };
 
-  for (const user of Object.values(users)) {
+  if (!users || typeof users !== "object") {
+    return used;
+  }
+
+  for (const [uid, user] of Object.entries(users)) {
     if (!user || typeof user !== "object") {
       continue;
     }
 
     const id = normalizePublicId(user.customId);
 
-    if (id) {
-      used.add(id);
+    if (id && !used[id]) {
+      used[id] = uid;
     }
   }
 
+  return used;
+}
+
+function chooseUnusedPublicId(usedIds) {
   for (let i = 0; i < 1000; i++) {
     const candidate = String(
       crypto.randomInt(100000, 1000000)
     );
 
-    if (!used.has(candidate)) {
+    if (!usedIds[candidate]) {
       return candidate;
     }
   }
@@ -133,13 +151,236 @@ function chooseUnusedPublicId(users) {
   for (let id = 100000; id <= 999999; id++) {
     const candidate = String(id);
 
-    if (!used.has(candidate)) {
+    if (!usedIds[candidate]) {
       return candidate;
     }
   }
 
   return null;
 }
+
+/*
+  Initialize the independent ID registry.
+
+  Existing IDs are imported before new
+  registrations can reserve an ID.
+
+  The registry transaction is separate from
+  Users and wallet transactions.
+*/
+
+async function initializeIdRegistry() {
+  if (!firebaseReady) {
+    throw new Error("FIREBASE_NOT_READY");
+  }
+
+  const usersSnapshot = await db()
+    .ref("Users")
+    .once("value");
+
+  const existingIds = collectExistingIds(
+    usersSnapshot.val()
+  );
+
+  const tx = await registryRef().transaction(
+    current => {
+      if (
+        current &&
+        current.initialized === true &&
+        current.ids &&
+        typeof current.ids === "object"
+      ) {
+        return;
+      }
+
+      const previousIds =
+        current &&
+        current.ids &&
+        typeof current.ids === "object"
+          ? current.ids
+          : {};
+
+      return {
+        initialized: true,
+        ids: {
+          ...existingIds,
+          ...previousIds
+        },
+        initializedAt: Date.now()
+      };
+    },
+    undefined,
+    false
+  );
+
+  const saved = tx.snapshot.val();
+
+  if (
+    !saved ||
+    saved.initialized !== true ||
+    !saved.ids ||
+    typeof saved.ids !== "object"
+  ) {
+    throw new Error("ID_REGISTRY_NOT_READY");
+  }
+
+  registryReady = true;
+  console.log("ID REGISTRY READY");
+}
+
+async function ensureRegistryReady() {
+  if (registryReady) {
+    return;
+  }
+
+  if (!registryInitPromise) {
+    registryInitPromise = initializeIdRegistry()
+      .catch(error => {
+        registryReady = false;
+        throw error;
+      })
+      .finally(() => {
+        registryInitPromise = null;
+      });
+  }
+
+  await registryInitPromise;
+}
+
+/*
+  Atomically reserve a public ID.
+
+  Repeated requests from the same UID
+  return the same reservation.
+
+  The transaction only touches the registry.
+*/
+
+async function reservePublicId(uid) {
+  let failure = "ID_RESERVATION_FAILED";
+
+  const tx = await registryRef().transaction(
+    current => {
+      if (
+        !current ||
+        current.initialized !== true ||
+        !current.ids ||
+        typeof current.ids !== "object"
+      ) {
+        failure = "ID_REGISTRY_NOT_READY";
+        return;
+      }
+
+      const ids = current.ids;
+
+      for (const [id, ownerUid] of Object.entries(ids)) {
+        if (
+          ownerUid === uid &&
+          /^[0-9]{6}$/.test(id)
+        ) {
+          return;
+        }
+      }
+
+      const newId = chooseUnusedPublicId(ids);
+
+      if (!newId) {
+        failure = "NO_AVAILABLE_PUBLIC_IDS";
+        return;
+      }
+
+      return {
+        ...current,
+        ids: {
+          ...ids,
+          [newId]: uid
+        }
+      };
+    },
+    undefined,
+    false
+  );
+
+  const saved = tx.snapshot.val();
+
+  if (!saved?.initialized || !saved?.ids) {
+    throw new Error(failure);
+  }
+
+  for (const [id, ownerUid] of Object.entries(
+    saved.ids
+  )) {
+    if (
+      ownerUid === uid &&
+      /^[0-9]{6}$/.test(id)
+    ) {
+      return id;
+    }
+  }
+
+  throw new Error(failure);
+}
+
+/*
+  Create only a missing user profile.
+
+  Existing profile data is never overwritten.
+*/
+
+async function createNewUserProfile(
+  uid,
+  decoded,
+  publicId
+) {
+  const tx = await userRef(uid).transaction(
+    current => {
+      if (current !== null) {
+        return;
+      }
+
+      return {
+        customId: publicId,
+        name: decoded.name || "",
+        profileImage: decoded.picture || "",
+        coins: 0,
+        isProfileCompleted: false,
+        createdAt: Date.now()
+      };
+    },
+    undefined,
+    false
+  );
+
+  const user = tx.snapshot.val();
+
+  if (!user) {
+    throw new Error("PROFILE_CREATION_FAILED");
+  }
+
+  const customId = normalizePublicId(
+    user.customId
+  );
+
+  if (!customId) {
+    throw new Error("EXISTING_ACCOUNT_MISSING_ID");
+  }
+
+  return {
+    created: tx.committed,
+    customId
+  };
+}
+
+/*
+  ANDROID LOGIN ENDPOINT
+
+  POST /api/users/ensure
+
+  Authorization: Bearer FIREBASE_ID_TOKEN
+
+  Existing accounts return their original ID.
+  Missing accounts receive a new six-digit ID.
+*/
 
 app.post("/api/users/ensure", async (req, res) => {
   if (!firebaseReady) {
@@ -163,11 +404,20 @@ app.post("/api/users/ensure", async (req, res) => {
   const uid = decoded.uid;
 
   try {
-    const existing = await userRef(uid).once("value");
+    /*
+      Existing users must be returned without
+      changing their profiles or wallets.
+    */
+
+    const existing = await userRef(uid)
+      .once("value");
 
     if (existing.exists()) {
       const user = existing.val();
-      const customId = normalizePublicId(user?.customId);
+
+      const customId = normalizePublicId(
+        user?.customId
+      );
 
       if (!customId) {
         return res.status(409).json({
@@ -184,78 +434,36 @@ app.post("/api/users/ensure", async (req, res) => {
     }
 
     /*
-      This transaction checks and creates the
-      account atomically under Users.
-
-      Concurrent registrations cannot select
-      the same public ID through this endpoint.
-
-      Existing accounts are preserved.
+      Registry initialization is required
+      BEFORE reserving any new ID.
     */
 
-    const tx = await db().ref("Users").transaction(
-      users => {
-        if (users === null) {
-          users = {};
-        }
+    try {
+      await ensureRegistryReady();
+    } catch (error) {
+      console.error(
+        "REGISTRY INIT ERROR:",
+        error.message
+      );
 
-        if (
-          typeof users !== "object" ||
-          Array.isArray(users)
-        ) {
-          return;
-        }
-
-        if (users[uid] !== undefined) {
-          return;
-        }
-
-        const newId = chooseUnusedPublicId(users);
-
-        if (!newId) {
-          return;
-        }
-
-        return {
-          ...users,
-          [uid]: {
-            customId: newId,
-            name: decoded.name || "",
-            profileImage: decoded.picture || "",
-            coins: 0,
-            isProfileCompleted: false,
-            createdAt: Date.now()
-          }
-        };
-      },
-      undefined,
-      false
-    );
-
-    /*
-      The transaction can be aborted when
-      another request already created this UID.
-      Read the final profile in both cases.
-    */
-
-    const finalSnap = await userRef(uid).once("value");
-    const finalUser = finalSnap.val();
-
-    const customId = normalizePublicId(
-      finalUser?.customId
-    );
-
-    if (!customId) {
-      return res.status(409).json({
+      return res.status(503).json({
         ok: false,
-        error: "PROFILE_CREATION_FAILED"
+        error: "ID_REGISTRY_NOT_READY"
       });
     }
 
+    const publicId = await reservePublicId(uid);
+
+    const result = await createNewUserProfile(
+      uid,
+      decoded,
+      publicId
+    );
+
     return res.json({
       ok: true,
-      created: tx.committed,
-      customId
+      created: result.created,
+      customId: result.customId
     });
 
   } catch (error) {
@@ -264,9 +472,28 @@ app.post("/api/users/ensure", async (req, res) => {
       error.message
     );
 
-    return res.status(500).json({
+    const knownErrors = new Set([
+      "ID_REGISTRY_NOT_READY",
+      "NO_AVAILABLE_PUBLIC_IDS",
+      "EXISTING_ACCOUNT_MISSING_ID",
+      "PROFILE_CREATION_FAILED",
+      "ID_RESERVATION_FAILED"
+    ]);
+
+    const code = knownErrors.has(error.message)
+      ? error.message
+      : "REGISTRATION_FAILED";
+
+    const status =
+      code === "ID_REGISTRY_NOT_READY"
+        ? 503
+        : code === "REGISTRATION_FAILED"
+          ? 500
+          : 409;
+
+    return res.status(status).json({
       ok: false,
-      error: "REGISTRATION_FAILED"
+      error: code
     });
   }
 });
@@ -521,7 +748,12 @@ async function advanceGame() {
   WALLET TRANSACTIONS
 */
 
-async function reserveCoins(uid, betId, amount, roundNumber) {
+async function reserveCoins(
+  uid,
+  betId,
+  amount,
+  roundNumber
+) {
   const ref = userRef(uid);
   let reason = "WALLET_REJECTED";
 
@@ -916,7 +1148,11 @@ function calculatePayouts(entry) {
   return totals;
 }
 
-async function creditWinner(uid, roundNumber, amount) {
+async function creditWinner(
+  uid,
+  roundNumber,
+  amount
+) {
   const key = String(roundNumber);
 
   const tx = await userRef(uid).transaction(
@@ -1251,9 +1487,29 @@ app.get("/", (req, res) => {
   });
 });
 
+/*
+  SERVER STARTUP
+*/
+
 server.listen(PORT, async () => {
   console.log("MAX CHAT SERVER RUNNING:", PORT);
   console.log("BETTING ENABLED:", BETTING_ENABLED);
+
+  /*
+    Prepare the ID registry independently.
+    New registration requests also await it.
+  */
+
+  if (firebaseReady) {
+    try {
+      await ensureRegistryReady();
+    } catch (error) {
+      console.error(
+        "REGISTRY STARTUP ERROR:",
+        error.message
+      );
+    }
+  }
 
   await loadGame();
 
