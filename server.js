@@ -63,15 +63,14 @@ const gameRef = () => db().ref(GAME_PATH);
 const userRef = uid => db().ref(`Users/${uid}`);
 
 /*
-  USER REGISTRATION
+  SECURE USER REGISTRATION
 
-  Firebase Authentication identifies the user.
-  The server creates missing profiles.
-
-  Existing profiles are never overwritten.
-
-  IDs are allocated using a single counter.
-  Previously used IDs are checked before use.
+  - Verify Firebase Authentication token.
+  - Preserve existing users without changes.
+  - Check all existing public IDs.
+  - Create new user in a Users transaction.
+  - Never allocate official owner ID.
+  - Never modify existing wallets or roles.
 */
 
 async function verifyRequestUser(req) {
@@ -96,53 +95,50 @@ async function verifyRequestUser(req) {
   }
 }
 
-async function allocateNewPublicId() {
-  const counterRef = db().ref("maxChatIdCounter");
-
-  for (let attempt = 0; attempt < 200000; attempt++) {
-    const tx = await counterRef.transaction(
-      current => {
-        const previous =
-          Number.isSafeInteger(Number(current)) &&
-          Number(current) >= 799999
-            ? Number(current)
-            : 799999;
-
-        if (previous >= 999999) return;
-
-        return previous + 1;
-      },
-      undefined,
-      false
-    );
-
-    if (!tx.committed) {
-      throw new Error("ID_RANGE_EXHAUSTED");
-    }
-
-    const candidate = String(tx.snapshot.val());
-
-    if (candidate === OFFICIAL_OWNER_ID) {
-      continue;
-    }
-
-    // Check legacy profiles that predate this counter.
-    const existing = await db()
-      .ref("Users")
-      .orderByChild("customId")
-      .equalTo(candidate)
-      .limitToFirst(1)
-      .once("value");
-
-    if (existing.exists()) {
-      continue;
-    }
-
-    // Reserve this number for audit and future checks.
-    return candidate;
+function normalizePublicId(value) {
+  if (value === null || value === undefined) {
+    return "";
   }
 
-  throw new Error("ID_ALLOCATION_FAILED");
+  const id = String(value).trim();
+
+  return /^[0-9]+$/.test(id) ? id : "";
+}
+
+function chooseUnusedPublicId(users) {
+  const used = new Set([OFFICIAL_OWNER_ID]);
+
+  for (const user of Object.values(users)) {
+    if (!user || typeof user !== "object") {
+      continue;
+    }
+
+    const id = normalizePublicId(user.customId);
+
+    if (id) {
+      used.add(id);
+    }
+  }
+
+  for (let i = 0; i < 1000; i++) {
+    const candidate = String(
+      crypto.randomInt(100000, 1000000)
+    );
+
+    if (!used.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  for (let id = 100000; id <= 999999; id++) {
+    const candidate = String(id);
+
+    if (!used.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
 }
 
 app.post("/api/users/ensure", async (req, res) => {
@@ -165,19 +161,15 @@ app.post("/api/users/ensure", async (req, res) => {
   }
 
   const uid = decoded.uid;
-  const ref = userRef(uid);
 
   try {
-    const existing = await ref.once("value");
+    const existing = await userRef(uid).once("value");
 
     if (existing.exists()) {
       const user = existing.val();
+      const customId = normalizePublicId(user?.customId);
 
-      if (
-        user.customId === undefined ||
-        user.customId === null ||
-        String(user.customId).trim() === ""
-      ) {
+      if (!customId) {
         return res.status(409).json({
           ok: false,
           error: "EXISTING_ACCOUNT_MISSING_ID"
@@ -187,34 +179,73 @@ app.post("/api/users/ensure", async (req, res) => {
       return res.json({
         ok: true,
         created: false,
-        customId: String(user.customId)
+        customId
       });
     }
 
-    const newId = await allocateNewPublicId();
+    /*
+      This transaction checks and creates the
+      account atomically under Users.
 
-    // Transaction prevents overwriting a profile
-    // created by another simultaneous request.
-    const tx = await ref.transaction(
-      current => {
-        if (current !== null) return;
+      Concurrent registrations cannot select
+      the same public ID through this endpoint.
+
+      Existing accounts are preserved.
+    */
+
+    const tx = await db().ref("Users").transaction(
+      users => {
+        if (users === null) {
+          users = {};
+        }
+
+        if (
+          typeof users !== "object" ||
+          Array.isArray(users)
+        ) {
+          return;
+        }
+
+        if (users[uid] !== undefined) {
+          return;
+        }
+
+        const newId = chooseUnusedPublicId(users);
+
+        if (!newId) {
+          return;
+        }
 
         return {
-          customId: newId,
-          name: decoded.name || "",
-          profileImage: decoded.picture || "",
-          coins: 0,
-          isProfileCompleted: false,
-          createdAt: Date.now()
+          ...users,
+          [uid]: {
+            customId: newId,
+            name: decoded.name || "",
+            profileImage: decoded.picture || "",
+            coins: 0,
+            isProfileCompleted: false,
+            createdAt: Date.now()
+          }
         };
       },
       undefined,
       false
     );
 
-    const user = tx.snapshot.val();
+    /*
+      The transaction can be aborted when
+      another request already created this UID.
+      Read the final profile in both cases.
+    */
 
-    if (!user?.customId) {
+    const finalSnap = await userRef(uid).once("value");
+    const finalUser = finalSnap.val();
+
+    const customId = normalizePublicId(
+      finalUser?.customId
+    );
+
+    if (!customId) {
       return res.status(409).json({
         ok: false,
         error: "PROFILE_CREATION_FAILED"
@@ -224,7 +255,7 @@ app.post("/api/users/ensure", async (req, res) => {
     return res.json({
       ok: true,
       created: tx.committed,
-      customId: String(user.customId)
+      customId
     });
 
   } catch (error) {
@@ -235,9 +266,7 @@ app.post("/api/users/ensure", async (req, res) => {
 
     return res.status(500).json({
       ok: false,
-      error: error.message === "ID_RANGE_EXHAUSTED"
-        ? "ID_RANGE_EXHAUSTED"
-        : "REGISTRATION_FAILED"
+      error: "REGISTRATION_FAILED"
     });
   }
 });
@@ -1110,8 +1139,7 @@ io.on("connection", socket => {
     socket.to(data.roomId).emit(
       "user_started_audio",
       {
-        userId: data.userId,
-        userName: data.userName
+        userId: data.userId
       }
     );
   });
