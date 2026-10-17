@@ -8,24 +8,32 @@ const { Server } = require("socket.io");
 
 const app = express();
 const server = http.createServer(app);
+
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
+app.use(express.json({ limit: "16kb" }));
+
 const PORT = process.env.PORT || 10000;
+
 const DB_URL =
   "https://maxvoice-a5e31-default-rtdb.europe-west1.firebasedatabase.app";
+
 const SECRET_PATH =
   "/etc/secrets/firebase-service-account.json";
 
 const GAME_PATH = "greedyLionGame";
 const GAME_ROOM = "maxchat_greedy_lion_global";
+
 const ROUND_MS = 25000;
 const MULTIPLIERS = [45, 5, 5, 10, 15, 5, 5, 25];
 const CHIPS = [100, 500, 1000, 5000, 10000];
 
 const BETTING_ENABLED =
   process.env.LION_ENABLE_BETS === "true";
+
+const OFFICIAL_OWNER_ID = "779157";
 
 let firebaseReady = false;
 let game = null;
@@ -53,6 +61,190 @@ try {
 const db = () => admin.database();
 const gameRef = () => db().ref(GAME_PATH);
 const userRef = uid => db().ref(`Users/${uid}`);
+
+/*
+  USER REGISTRATION
+
+  Firebase Authentication identifies the user.
+  The server creates missing profiles.
+
+  Existing profiles are never overwritten.
+
+  IDs are allocated using a single counter.
+  Previously used IDs are checked before use.
+*/
+
+async function verifyRequestUser(req) {
+  const header = req.headers.authorization || "";
+  const match = /^Bearer (.+)$/i.exec(header);
+
+  if (!match) {
+    const error = new Error("TOKEN_REQUIRED");
+    error.status = 401;
+    throw error;
+  }
+
+  try {
+    return await admin.auth().verifyIdToken(
+      match[1],
+      true
+    );
+  } catch {
+    const error = new Error("INVALID_TOKEN");
+    error.status = 401;
+    throw error;
+  }
+}
+
+async function allocateNewPublicId() {
+  const counterRef = db().ref("maxChatIdCounter");
+
+  for (let attempt = 0; attempt < 200000; attempt++) {
+    const tx = await counterRef.transaction(
+      current => {
+        const previous =
+          Number.isSafeInteger(Number(current)) &&
+          Number(current) >= 799999
+            ? Number(current)
+            : 799999;
+
+        if (previous >= 999999) return;
+
+        return previous + 1;
+      },
+      undefined,
+      false
+    );
+
+    if (!tx.committed) {
+      throw new Error("ID_RANGE_EXHAUSTED");
+    }
+
+    const candidate = String(tx.snapshot.val());
+
+    if (candidate === OFFICIAL_OWNER_ID) {
+      continue;
+    }
+
+    // Check legacy profiles that predate this counter.
+    const existing = await db()
+      .ref("Users")
+      .orderByChild("customId")
+      .equalTo(candidate)
+      .limitToFirst(1)
+      .once("value");
+
+    if (existing.exists()) {
+      continue;
+    }
+
+    // Reserve this number for audit and future checks.
+    return candidate;
+  }
+
+  throw new Error("ID_ALLOCATION_FAILED");
+}
+
+app.post("/api/users/ensure", async (req, res) => {
+  if (!firebaseReady) {
+    return res.status(503).json({
+      ok: false,
+      error: "FIREBASE_NOT_READY"
+    });
+  }
+
+  let decoded;
+
+  try {
+    decoded = await verifyRequestUser(req);
+  } catch (error) {
+    return res.status(error.status || 401).json({
+      ok: false,
+      error: error.message
+    });
+  }
+
+  const uid = decoded.uid;
+  const ref = userRef(uid);
+
+  try {
+    const existing = await ref.once("value");
+
+    if (existing.exists()) {
+      const user = existing.val();
+
+      if (
+        user.customId === undefined ||
+        user.customId === null ||
+        String(user.customId).trim() === ""
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error: "EXISTING_ACCOUNT_MISSING_ID"
+        });
+      }
+
+      return res.json({
+        ok: true,
+        created: false,
+        customId: String(user.customId)
+      });
+    }
+
+    const newId = await allocateNewPublicId();
+
+    // Transaction prevents overwriting a profile
+    // created by another simultaneous request.
+    const tx = await ref.transaction(
+      current => {
+        if (current !== null) return;
+
+        return {
+          customId: newId,
+          name: decoded.name || "",
+          profileImage: decoded.picture || "",
+          coins: 0,
+          isProfileCompleted: false,
+          createdAt: Date.now()
+        };
+      },
+      undefined,
+      false
+    );
+
+    const user = tx.snapshot.val();
+
+    if (!user?.customId) {
+      return res.status(409).json({
+        ok: false,
+        error: "PROFILE_CREATION_FAILED"
+      });
+    }
+
+    return res.json({
+      ok: true,
+      created: tx.committed,
+      customId: String(user.customId)
+    });
+
+  } catch (error) {
+    console.error(
+      "USER REGISTRATION ERROR:",
+      error.message
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error: error.message === "ID_RANGE_EXHAUSTED"
+        ? "ID_RANGE_EXHAUSTED"
+        : "REGISTRATION_FAILED"
+    });
+  }
+});
+
+/*
+  GAME STATE
+*/
 
 function validGame(g) {
   return Boolean(
@@ -219,6 +411,7 @@ async function advanceGame() {
 
         const roundNumber = current.roundNumber;
         const activeBets = current.activeBets || {};
+
         const pending = {
           ...(current.pendingSettlement || {})
         };
@@ -263,6 +456,7 @@ async function advanceGame() {
     if (!validGame(saved)) return;
 
     const previous = game?.roundNumber;
+
     game = saved;
     lastSync = Date.now();
 
@@ -271,6 +465,7 @@ async function advanceGame() {
       game.roundNumber > previous
     ) {
       const completed = game.roundNumber - 1;
+
       const result = historyArray(game.history)
         .find(x => x.roundNumber === completed);
 
@@ -295,12 +490,6 @@ async function advanceGame() {
 
 /*
   WALLET TRANSACTIONS
-
-  A bet is first reserved in the user's wallet.
-  Then it is recorded in the game.
-
-  If the game rejects it, the reservation is
-  refunded using the same unique bet ID.
 */
 
 async function reserveCoins(uid, betId, amount, roundNumber) {
@@ -366,7 +555,6 @@ async function setBetStatus(uid, betId, status) {
       const bet = user.lionBets[betId];
 
       if (bet.status === status) return;
-
       if (bet.status !== "reserved") return;
 
       return {
@@ -397,7 +585,6 @@ async function refundBet(uid, betId) {
       const bet = user.lionBets[betId];
 
       if (bet.status === "refunded") return;
-
       if (bet.status !== "reserved") return;
 
       const coins = Number(user.coins);
@@ -594,9 +781,6 @@ async function placeBet(data) {
       };
     }
 
-    // A committed game bet must not be refunded.
-    // If marking the wallet fails, the game bet
-    // still exists and can be reconciled later.
     try {
       await setBetStatus(uid, betId, "accepted");
     } catch (error) {
@@ -624,11 +808,10 @@ async function placeBet(data) {
       roundNumber,
       balance: reserved.balance
     };
+
   } catch (error) {
     console.error("BET ERROR:", error.message);
 
-    // The game transaction may have committed
-    // before a network error. Check before refund.
     try {
       const snap = await gameRef().once("value");
       const saved = snap.val();
@@ -673,14 +856,10 @@ async function placeBet(data) {
 
 /*
   PAYOUTS
-
-  The payout marker is written in the same
-  user transaction as the coin credit.
 */
 
 function calculatePayouts(entry) {
   const totals = {};
-
   const winner = Number(entry.winningIndex);
 
   for (const bet of Object.values(entry.bets || {})) {
@@ -775,7 +954,6 @@ async function settlePending() {
     for (const [key, entry] of Object.entries(pending)) {
       if (!entry || entry.settled) continue;
 
-      // Old settlement records are preserved.
       if (
         entry.payoutVersion !== 1 &&
         entry.payoutVersion !== 2
@@ -818,6 +996,7 @@ async function settlePending() {
 
       console.log("ROUND SETTLED:", key);
     }
+
   } catch (error) {
     console.error(
       "SETTLEMENT ERROR:",
@@ -931,7 +1110,8 @@ io.on("connection", socket => {
     socket.to(data.roomId).emit(
       "user_started_audio",
       {
-        userId: data.userId
+        userId: data.userId,
+        userName: data.userName
       }
     );
   });
