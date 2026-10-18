@@ -129,7 +129,7 @@ async function verifyToken(token) {
   }
 
   try {
-    return await admin.auth().verifyIdToken(token, true);
+    return await admin.auth().verifyIdToken(token);
   } catch {
     throw new Error("INVALID_TOKEN");
   }
@@ -387,13 +387,7 @@ async function buildWinnerDetails(entry) {
 
 async function publishRoundWinners(entry) {
   const roundNumber = Number(entry.roundNumber);
-  const key = String(roundNumber);
-
   const winners = await buildWinnerDetails(entry);
-
-  const resultRef = gameRef()
-    .child("history")
-    .child(key);
 
   const patch = {
     winners,
@@ -403,7 +397,7 @@ async function publishRoundWinners(entry) {
 
   // Existing history may be an array. Locate the result
   // through a transaction on the parent game state.
-  await transactionReady(gameRef(), current => {
+  const winnerTx = await transactionReady(gameRef(), current => {
     if (!validGame(current)) return;
 
     const history = historyArray(current.history);
@@ -425,6 +419,13 @@ async function publishRoundWinners(entry) {
       history
     };
   });
+
+  if (!winnerTx.committed) {
+    const saved = historyArray(winnerTx.snapshot.val()?.history).find(
+      x => Number(x.roundNumber) === roundNumber && x.hasSettledBets === true
+    );
+    if (!saved) throw new Error("WINNER_HISTORY_NOT_SAVED");
+  }
 
   const result = {
     roundNumber,
@@ -480,34 +481,9 @@ async function startGame() {
           return;
         }
 
-        const previousRound = game?.roundNumber ?? null;
         game = saved;
-
-        if (
-          previousRound !== null &&
-          saved.roundNumber > previousRound
-        ) {
-          const completed = saved.roundNumber - 1;
-
-          const result = historyArray(saved.history)
-            .find(
-              item =>
-                Number(item.roundNumber) === completed
-            );
-
-          if (result) {
-            const resultKey = String(result.roundNumber);
-
-            if (lastRoundResult !== resultKey) {
-              lastRoundResult = resultKey;
-
-              io.to(GAME_ROOM).emit(
-                "greedy_lion_round_result",
-                result
-              );
-            }
-          }
-        }
+        // Each round result is broadcast when it is actually announced.
+        // Never rebroadcast the previous result as the next round starts.
 
         sendState();
       },
@@ -772,6 +748,22 @@ async function placeBet(data) {
   const currentGame = (
     await gameRef().once("value")
   ).val();
+
+  const priorBet = wallet.user?.lionBets?.[betId];
+  if (priorBet) {
+    const matches = Number(priorBet.amount) === amount &&
+      Number(priorBet.roundNumber) === roundNumber;
+    if (!matches) return errorResult("DUPLICATE_BET");
+    const inActive = Boolean(currentGame?.activeBets?.[betKey]);
+    const inPending = Object.values(currentGame?.pendingSettlement || {})
+      .some(entry => Boolean(entry?.bets?.[betKey]));
+    if (inActive || inPending || priorBet.status === "accepted") {
+      return { ok: true, betId, foodIndex, amount, roundNumber,
+        balance: wallet.coins, alreadyAccepted: true };
+    }
+    if (priorBet.status === "refunded") return errorResult("BET_FAILED_REFUNDED");
+    return errorResult("BET_STATUS_UNCERTAIN");
+  }
 
   if (
     !validGame(currentGame) ||
@@ -1608,8 +1600,10 @@ httpServer.listen(PORT, async () => {
   await startGame();
 
   if (game && Date.now() >= Number(game.roundEndsAt)) {
-    await announceRoundResult();
-    if (Date.now() >= Number(game.cycleEndsAt || (Number(game.roundEndsAt) + RESULT_MS))) await advanceGame();
+    try {
+      await announceRoundResult();
+      if (Date.now() >= Number(game.cycleEndsAt || (Number(game.roundEndsAt) + RESULT_MS))) await advanceGame();
+    } catch (error) { console.error("STARTUP ROUND ERROR", error.message); }
   }
 
   console.log(
