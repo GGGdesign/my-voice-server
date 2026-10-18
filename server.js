@@ -31,21 +31,26 @@ const MULTIPLIERS = [45, 5, 5, 10, 15, 5, 5, 25];
 const CHIPS = [100, 500, 1000, 5000, 10000];
 
 const BETTING_ENABLED =
-  process.env.LION_ENABLE_BETS === "true";
+  process.env.LION_ENABLE_BETS !== "false";
 
-// Gift prices are provisional.
-// Match these IDs and prices to the Android gift catalog.
 const GIFT_CATALOG = Object.freeze({
-  rose: { name: "Rose", price: 100 },
-  heart: { name: "Heart", price: 200 },
-  flower: { name: "Flower", price: 500 },
-  cake: { name: "Cake", price: 1000 },
-  car: { name: "Car", price: 5000 },
-  crown: { name: "Crown", price: 10000 }
+  rose: { name: "وردة ملكية", price: 100 },
+  heart: { name: "قلب الحب", price: 200 },
+  bear: { name: "دبدوب", price: 500 },
+  crown: { name: "تاج ملكي", price: 1000 },
+  bouquet: { name: "باقة ورد", price: 2000 },
+  car: { name: "سيارة فاخرة", price: 5000 },
+  yacht: { name: "يخت", price: 10000 },
+  palace: { name: "قصر", price: 20000 },
+  diamond: { name: "ألماس", price: 50000 },
+  horse: { name: "حصان ملكي", price: 100000 },
+  dragon: { name: "تنين أسطوري", price: 500000 },
+  galaxy: { name: "المجرة", price: 1000000 },
+  tree: { name: "شجرة الذهب", price: 2000000 },
+  throne: { name: "عرش ملكي", price: 5000000 },
+  kingdom: { name: "مملكة الذهب", price: 10000000 }
 });
 
-// Enable only after checking the real gift catalog
-// and securing Firebase wallet rules.
 const GIFTS_ENABLED =
   process.env.MAXCHAT_ENABLE_GIFTS === "true";
 
@@ -923,7 +928,11 @@ async function giftReceiverOnSeat(roomId, receiverId) {
       seat.child("userId").val() || ""
     );
 
-    if (id === receiverId) {
+    const uid = String(
+      seat.child("userUid").val() || ""
+    );
+
+    if (id === receiverId || uid === receiverId) {
       found = true;
     }
   });
@@ -1057,7 +1066,10 @@ async function publishGift(uid, request, payment) {
   return saved;
 }
 
-// Gift catalog endpoint
+// =====================================================
+// GIFT API
+// =====================================================
+
 app.get("/api/gifts/catalog", (req, res) => {
   return res.json({
     ok: true,
@@ -1066,7 +1078,6 @@ app.get("/api/gifts/catalog", (req, res) => {
   });
 });
 
-// Secure gift sending endpoint
 app.post("/api/gifts/send", async (req, res) => {
   if (!firebaseReady) {
     return giftError(
@@ -1107,7 +1118,7 @@ app.post("/api/gifts/send", async (req, res) => {
   if (
     !validGiftId(roomId) ||
     !validGiftId(giftId) ||
-    !/^[0-9]{1,20}$/.test(receiverId) ||
+    !validGiftId(receiverId) ||
     !validGiftRequestId(requestId) ||
     !Number.isSafeInteger(quantity) ||
     quantity < 1 ||
@@ -1157,7 +1168,6 @@ app.post("/api/gifts/send", async (req, res) => {
   };
 
   try {
-    // Repeated requests must retain the same details.
     const previousSnapshot = await userRef(uid)
       .child("giftPayments")
       .child(requestId)
@@ -1206,8 +1216,6 @@ app.post("/api/gifts/send", async (req, res) => {
       );
     }
 
-    // The event is stored only after payment.
-    // Retrying the same request cannot charge twice.
     await publishGift(
       uid,
       request,
