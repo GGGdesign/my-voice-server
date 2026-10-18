@@ -101,22 +101,7 @@ function errorResult(error) {
 
 // Initialize Firebase listener before transactions.
 async function transactionReady(ref, updater) {
-  let listener = null;
-
-  try {
-    await new Promise((resolve, reject) => {
-      listener = snapshot => resolve(snapshot);
-      ref.on("value", listener, reject);
-    });
-
-    return await ref.transaction(
-      updater,
-      undefined,
-      false
-    );
-  } finally {
-    if (listener) ref.off("value", listener);
-  }
+  return ref.transaction(updater, undefined, false);
 }
 
 async function verifyToken(token) {
@@ -186,6 +171,7 @@ let gameStarted = false;
 let roundProcessing = false;
 let settlementProcessing = false;
 let lastRoundResult = null;
+let lastGameStateEmit = 0;
 
 function validGame(value) {
   return Boolean(
@@ -1576,12 +1562,12 @@ setInterval(() => {
     if (Date.now() >= Number(game.roundEndsAt) && !recorded) announceRoundResult().catch(console.error);
     else if (Date.now() >= Number(game.cycleEndsAt || (Number(game.roundEndsAt) + RESULT_MS)) && recorded) advanceGame().catch(console.error);
   }
-}, 1000);
+}, 250);
 
 // Faster fallback for settlement failures.
 setInterval(() => {
   settlePending().catch(console.error);
-}, 1000);
+}, 500);
 
 // ==================================================
 // HEALTH
