@@ -101,22 +101,7 @@ function errorResult(error) {
 
 // Initialize Firebase listener before transactions.
 async function transactionReady(ref, updater) {
-  let listener = null;
-
-  try {
-    await new Promise((resolve, reject) => {
-      listener = snapshot => resolve(snapshot);
-      ref.on("value", listener, reject);
-    });
-
-    return await ref.transaction(
-      updater,
-      undefined,
-      false
-    );
-  } finally {
-    if (listener) ref.off("value", listener);
-  }
+  return ref.transaction(updater, undefined, false);
 }
 
 async function verifyToken(token) {
@@ -186,6 +171,7 @@ let gameStarted = false;
 let roundProcessing = false;
 let settlementProcessing = false;
 let lastRoundResult = null;
+let lastGameStateEmit = 0;
 
 function validGame(value) {
   return Boolean(
@@ -306,6 +292,9 @@ function profilePhoto(user) {
     user?.avatarUrl ||
     user?.avatar ||
     user?.imageUrl ||
+    user?.profilePicture ||
+    user?.profilePhoto ||
+    user?.picture ||
     ""
   );
 }
@@ -522,13 +511,27 @@ async function announceRoundResult() {
       };
       return {...current, pendingSettlement: pending, history: [...historyArray(current.history), {
         roundNumber: currentRound, winningIndex, completedAt: now,
-        hasSettledBets: Object.keys(bets).length === 0, winners: [], topWinners: []
+        hasSettledBets: false, winners: [], topWinners: []
       }].slice(-8)};
     });
     if (tx.committed) {
       game = tx.snapshot.val();
       const result = historyArray(game.history).find(x => Number(x.roundNumber) === currentRound);
       if (result) io.to(GAME_ROOM).emit("greedy_lion_round_result", result);
+      // Empty rounds have no payout work; confirm this to all clients.
+      if (result && Object.keys(game.activeBets || {}).length === 0) {
+        const emptyResult = {...result, hasSettledBets: true, winners: [], topWinners: []};
+        await transactionReady(gameRef(), current => {
+          if (!validGame(current)) return;
+          const history = historyArray(current.history);
+          const i = history.findIndex(h => Number(h.roundNumber) === currentRound);
+          if (i < 0 || history[i].hasSettledBets) return;
+          history[i] = emptyResult;
+          return {...current, history};
+        });
+        io.to(GAME_ROOM).emit("greedy_lion_winners", emptyResult);
+        io.to(GAME_ROOM).emit("greedy_lion_round_result", emptyResult);
+      }
       sendState();
       settlePending().catch(console.error);
     }
@@ -773,6 +776,15 @@ async function placeBet(data) {
     return errorResult("ROUND_CLOSED");
   }
 
+  const occupied = new Set(
+    Object.values(currentGame.activeBets || {})
+      .filter(b => b.uid === uid)
+      .map(b => Number(b.foodIndex))
+  );
+  if (!occupied.has(foodIndex) && occupied.size >= 6) {
+    return errorResult("MAX_SIX_SLOTS");
+  }
+
   let reserved;
 
   try {
@@ -860,7 +872,8 @@ async function placeBet(data) {
       );
     }
 
-    game = tx.snapshot.val();
+    // The Firebase listener owns the current round state.
+    // A delayed bet response must not rewind the local game cache.
 
     try {
       await setBetStatus(uid, betId, "accepted");
@@ -1549,12 +1562,12 @@ setInterval(() => {
     if (Date.now() >= Number(game.roundEndsAt) && !recorded) announceRoundResult().catch(console.error);
     else if (Date.now() >= Number(game.cycleEndsAt || (Number(game.roundEndsAt) + RESULT_MS)) && recorded) advanceGame().catch(console.error);
   }
-}, 1000);
+}, 250);
 
 // Faster fallback for settlement failures.
 setInterval(() => {
   settlePending().catch(console.error);
-}, 1000);
+}, 500);
 
 // ==================================================
 // HEALTH
@@ -1569,7 +1582,7 @@ app.get("/", (req, res) => {
     status: "online",
     firebaseReady,
     bettingEnabled:
-      firebaseReady && BETTING_ENABLED,
+      firebaseReady && BETTING_ENABLED && phase() === "betting",
     giftsEnabled:
       firebaseReady && GIFTS_ENABLED,
     roundNumber: game?.roundNumber ?? null,
