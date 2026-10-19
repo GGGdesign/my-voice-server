@@ -101,7 +101,22 @@ function errorResult(error) {
 
 // Initialize Firebase listener before transactions.
 async function transactionReady(ref, updater) {
-  return ref.transaction(updater, undefined, false);
+  let listener = null;
+
+  try {
+    await new Promise((resolve, reject) => {
+      listener = snapshot => resolve(snapshot);
+      ref.on("value", listener, reject);
+    });
+
+    return await ref.transaction(
+      updater,
+      undefined,
+      false
+    );
+  } finally {
+    if (listener) ref.off("value", listener);
+  }
 }
 
 async function verifyToken(token) {
@@ -114,7 +129,7 @@ async function verifyToken(token) {
   }
 
   try {
-    return await admin.auth().verifyIdToken(token);
+    return await admin.auth().verifyIdToken(token, true);
   } catch {
     throw new Error("INVALID_TOKEN");
   }
@@ -171,7 +186,6 @@ let gameStarted = false;
 let roundProcessing = false;
 let settlementProcessing = false;
 let lastRoundResult = null;
-let lastGameStateEmit = 0;
 
 function validGame(value) {
   return Boolean(
@@ -292,9 +306,6 @@ function profilePhoto(user) {
     user?.avatarUrl ||
     user?.avatar ||
     user?.imageUrl ||
-    user?.profilePicture ||
-    user?.profilePhoto ||
-    user?.picture ||
     ""
   );
 }
@@ -376,7 +387,13 @@ async function buildWinnerDetails(entry) {
 
 async function publishRoundWinners(entry) {
   const roundNumber = Number(entry.roundNumber);
+  const key = String(roundNumber);
+
   const winners = await buildWinnerDetails(entry);
+
+  const resultRef = gameRef()
+    .child("history")
+    .child(key);
 
   const patch = {
     winners,
@@ -386,7 +403,7 @@ async function publishRoundWinners(entry) {
 
   // Existing history may be an array. Locate the result
   // through a transaction on the parent game state.
-  const winnerTx = await transactionReady(gameRef(), current => {
+  await transactionReady(gameRef(), current => {
     if (!validGame(current)) return;
 
     const history = historyArray(current.history);
@@ -408,13 +425,6 @@ async function publishRoundWinners(entry) {
       history
     };
   });
-
-  if (!winnerTx.committed) {
-    const saved = historyArray(winnerTx.snapshot.val()?.history).find(
-      x => Number(x.roundNumber) === roundNumber && x.hasSettledBets === true
-    );
-    if (!saved) throw new Error("WINNER_HISTORY_NOT_SAVED");
-  }
 
   const result = {
     roundNumber,
@@ -470,9 +480,34 @@ async function startGame() {
           return;
         }
 
+        const previousRound = game?.roundNumber ?? null;
         game = saved;
-        // Each round result is broadcast when it is actually announced.
-        // Never rebroadcast the previous result as the next round starts.
+
+        if (
+          previousRound !== null &&
+          saved.roundNumber > previousRound
+        ) {
+          const completed = saved.roundNumber - 1;
+
+          const result = historyArray(saved.history)
+            .find(
+              item =>
+                Number(item.roundNumber) === completed
+            );
+
+          if (result) {
+            const resultKey = String(result.roundNumber);
+
+            if (lastRoundResult !== resultKey) {
+              lastRoundResult = resultKey;
+
+              io.to(GAME_ROOM).emit(
+                "greedy_lion_round_result",
+                result
+              );
+            }
+          }
+        }
 
         sendState();
       },
@@ -511,27 +546,13 @@ async function announceRoundResult() {
       };
       return {...current, pendingSettlement: pending, history: [...historyArray(current.history), {
         roundNumber: currentRound, winningIndex, completedAt: now,
-        hasSettledBets: false, winners: [], topWinners: []
+        hasSettledBets: Object.keys(bets).length === 0, winners: [], topWinners: []
       }].slice(-8)};
     });
     if (tx.committed) {
       game = tx.snapshot.val();
       const result = historyArray(game.history).find(x => Number(x.roundNumber) === currentRound);
       if (result) io.to(GAME_ROOM).emit("greedy_lion_round_result", result);
-      // Empty rounds have no payout work; confirm this to all clients.
-      if (result && Object.keys(game.activeBets || {}).length === 0) {
-        const emptyResult = {...result, hasSettledBets: true, winners: [], topWinners: []};
-        await transactionReady(gameRef(), current => {
-          if (!validGame(current)) return;
-          const history = historyArray(current.history);
-          const i = history.findIndex(h => Number(h.roundNumber) === currentRound);
-          if (i < 0 || history[i].hasSettledBets) return;
-          history[i] = emptyResult;
-          return {...current, history};
-        });
-        io.to(GAME_ROOM).emit("greedy_lion_winners", emptyResult);
-        io.to(GAME_ROOM).emit("greedy_lion_round_result", emptyResult);
-      }
       sendState();
       settlePending().catch(console.error);
     }
@@ -752,37 +773,12 @@ async function placeBet(data) {
     await gameRef().once("value")
   ).val();
 
-  const priorBet = wallet.user?.lionBets?.[betId];
-  if (priorBet) {
-    const matches = Number(priorBet.amount) === amount &&
-      Number(priorBet.roundNumber) === roundNumber;
-    if (!matches) return errorResult("DUPLICATE_BET");
-    const inActive = Boolean(currentGame?.activeBets?.[betKey]);
-    const inPending = Object.values(currentGame?.pendingSettlement || {})
-      .some(entry => Boolean(entry?.bets?.[betKey]));
-    if (inActive || inPending || priorBet.status === "accepted") {
-      return { ok: true, betId, foodIndex, amount, roundNumber,
-        balance: wallet.coins, alreadyAccepted: true };
-    }
-    if (priorBet.status === "refunded") return errorResult("BET_FAILED_REFUNDED");
-    return errorResult("BET_STATUS_UNCERTAIN");
-  }
-
   if (
     !validGame(currentGame) ||
     currentGame.roundNumber !== roundNumber ||
     Date.now() >= Number(currentGame.roundEndsAt)
   ) {
     return errorResult("ROUND_CLOSED");
-  }
-
-  const occupied = new Set(
-    Object.values(currentGame.activeBets || {})
-      .filter(b => b.uid === uid)
-      .map(b => Number(b.foodIndex))
-  );
-  if (!occupied.has(foodIndex) && occupied.size >= 6) {
-    return errorResult("MAX_SIX_SLOTS");
   }
 
   let reserved;
@@ -872,8 +868,7 @@ async function placeBet(data) {
       );
     }
 
-    // The Firebase listener owns the current round state.
-    // A delayed bet response must not rewind the local game cache.
+    game = tx.snapshot.val();
 
     try {
       await setBetStatus(uid, betId, "accepted");
@@ -1562,12 +1557,12 @@ setInterval(() => {
     if (Date.now() >= Number(game.roundEndsAt) && !recorded) announceRoundResult().catch(console.error);
     else if (Date.now() >= Number(game.cycleEndsAt || (Number(game.roundEndsAt) + RESULT_MS)) && recorded) advanceGame().catch(console.error);
   }
-}, 250);
+}, 1000);
 
 // Faster fallback for settlement failures.
 setInterval(() => {
   settlePending().catch(console.error);
-}, 500);
+}, 1000);
 
 // ==================================================
 // HEALTH
@@ -1582,7 +1577,7 @@ app.get("/", (req, res) => {
     status: "online",
     firebaseReady,
     bettingEnabled:
-      firebaseReady && BETTING_ENABLED && phase() === "betting",
+      firebaseReady && BETTING_ENABLED,
     giftsEnabled:
       firebaseReady && GIFTS_ENABLED,
     roundNumber: game?.roundNumber ?? null,
@@ -1613,10 +1608,8 @@ httpServer.listen(PORT, async () => {
   await startGame();
 
   if (game && Date.now() >= Number(game.roundEndsAt)) {
-    try {
-      await announceRoundResult();
-      if (Date.now() >= Number(game.cycleEndsAt || (Number(game.roundEndsAt) + RESULT_MS))) await advanceGame();
-    } catch (error) { console.error("STARTUP ROUND ERROR", error.message); }
+    await announceRoundResult();
+    if (Date.now() >= Number(game.cycleEndsAt || (Number(game.roundEndsAt) + RESULT_MS))) await advanceGame();
   }
 
   console.log(
