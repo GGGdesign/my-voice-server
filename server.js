@@ -186,6 +186,35 @@ let game = null;
 let gameStarted = false;
 let roundProcessing = false;
 let settlementProcessing = false;
+// Requests received BEFORE the deadline must be finished before the draw.
+// The client can display them optimistically; ONLY a server transaction
+// changes coins, as required by the database security rules.
+const incomingBets = new Map();
+const MAX_SETTLE_WAIT_MS = 20000;
+
+function beginIncoming(round) {
+  incomingBets.set(round, (incomingBets.get(round) || 0) + 1);
+}
+function endIncoming(round) {
+  const count = (incomingBets.get(round) || 0) - 1;
+  if (count <= 0) incomingBets.delete(round);
+  else incomingBets.set(round, count);
+}
+function admissionFor(data) {
+  if (!firebaseReady || !game) return errorResult("SERVER_NOT_READY");
+  if (!BETTING_ENABLED) return errorResult("BETTING_DISABLED");
+  const now = Date.now();
+  const round = Number(data?.roundNumber);
+  const index = Number(data?.foodIndex);
+  const amount = Number(data?.amount);
+  const id = String(data?.betId || "");
+  if (!/^[a-f0-9]{32}$/i.test(id) || !Number.isInteger(index) ||
+      index < 0 || index > 7 || !CHIPS.includes(amount) ||
+      !Number.isSafeInteger(round)) return errorResult("INVALID_BET");
+  if (game.roundNumber !== round || now >= Number(game.roundEndsAt))
+    return errorResult("ROUND_CLOSED");
+  return { ok: true, round, receivedAt: now };
+}
 
 
 function validGame(value) {
@@ -223,7 +252,11 @@ function cycleEnd(value) {
 
 function currentPhase(value, now = Date.now()) {
   if (!validGame(value)) return "waiting";
-  return now < Number(value.roundEndsAt) ? "betting" : "result";
+  if (now < Number(value.roundEndsAt)) return "betting";
+  const recorded = historyArray(value.history).some(
+    entry => Number(entry.roundNumber) === Number(value.roundNumber)
+  );
+  return recorded ? "result" : "closing";
 }
 
 function createGame(now) {
@@ -240,7 +273,9 @@ function createGame(now) {
 
 function remaining() {
   if (!game) return null;
-  const until = currentPhase(game) === "betting"
+  const phase = currentPhase(game);
+  if (phase === "closing") return 0;
+  const until = phase === "betting"
     ? Number(game.roundEndsAt)
     : cycleEnd(game);
   return Math.max(0, Math.ceil((until - Date.now()) / 1000));
@@ -292,22 +327,29 @@ function profileName(user) {
     user?.userName ||
     user?.username ||
     user?.nickname ||
+    user?.displayName ||
+    user?.fullName ||
+    user?.profile?.displayName ||
+    user?.profile?.name ||
     "مستخدم"
   );
 }
 
 function profilePhoto(user) {
-  const candidate = String(
-    user?.profileImageUrl ||
-    user?.profileImage ||
-    user?.photoUrl ||
-    user?.photoURL ||
-    user?.avatarUrl ||
-    user?.imageUrl ||
-    ""
-  ).trim();
-  // Do not accidentally show a flag or emoji stored in an `avatar` field.
-  return /^(https?:\/\/|data:image\/)/i.test(candidate) ? candidate : "";
+  // Some profiles have a flag in avatar but a real photo in another field.
+  // Choose the first valid image URI, not simply the first non-empty field.
+  const fields = [
+    user?.profileImageUrl, user?.profileImage, user?.photoUrl,
+    user?.photoURL, user?.avatarUrl, user?.imageUrl,
+    user?.picture, user?.profilePhoto, user?.photo,
+    user?.profile?.photoUrl, user?.profile?.photoURL
+  ];
+  for (const field of fields) {
+    if (typeof field !== "string") continue;
+    const value = field.trim();
+    if (/^(https?:\/\/|data:image\/)/i.test(value)) return value;
+  }
+  return "";
 }
 
 function calculatePayouts(entry) {
@@ -354,6 +396,20 @@ async function buildWinnerDetails(entry) {
       try {
         const snapshot = await userRef(uid).once("value");
         user = snapshot.val() || {};
+        // Prefer the actual Firebase Auth profile over non-image avatars.
+        if (!profilePhoto(user) || profileName(user) === "مستخدم") {
+          try {
+            const authUser = await admin.auth().getUser(uid);
+            user = {
+              ...user,
+              name: profileName(user) === "مستخدم"
+                ? (authUser.displayName || "مستخدم") : profileName(user),
+              profileImageUrl: profilePhoto(user) || authUser.photoURL || ""
+            };
+          } catch (authError) {
+            console.warn("AUTH PROFILE UNAVAILABLE", uid, authError.message);
+          }
+        }
       } catch (error) {
         console.error(
           "WINNER PROFILE ERROR:",
@@ -510,6 +566,11 @@ async function closeRound() {
   if (!firebaseReady || !game || roundProcessing) return;
   roundProcessing = true;
   try {
+    const waiting = incomingBets.get(Number(game.roundNumber)) || 0;
+    if (waiting > 0 && Date.now() < Number(game.roundEndsAt) + MAX_SETTLE_WAIT_MS) {
+      // Protect all bets that arrived while the round was still open.
+      return;
+    }
     const win = crypto.randomInt(8);
     const now = Date.now();
     const tx = await transactionReady(gameRef(), current => {
@@ -537,7 +598,8 @@ async function closeRound() {
       }
       return {
         ...current,
-        cycleEndsAt: cycleEnd(current),
+        // Always give the result six full seconds even after slow bets.
+        cycleEndsAt: Math.max(cycleEnd(current), Date.now() + RESULT_MS),
         pendingSettlement: pending,
         history: [...history, result].slice(-8)
       };
@@ -602,13 +664,8 @@ async function reserveCoins(
   amount,
   roundNumber
 ) {
-  const wallet = await readWallet(
-    uid,
-    "BET_RESERVE"
-  );
-
-  if (!wallet.ok) return wallet;
-
+  // One atomic wallet transaction: do not do an extra round-trip
+  // to read the same wallet before attempting this debit.
   let reason = "WALLET_REJECTED";
 
   const tx = await transactionReady(
@@ -736,7 +793,7 @@ async function refundBet(uid, betId) {
   );
 }
 
-async function placeBet(data) {
+async function placeBet(data, admission) {
   if (!BETTING_ENABLED) {
     return errorResult("BETTING_DISABLED");
   }
@@ -773,25 +830,17 @@ async function placeBet(data) {
 
   const uid = decoded.uid;
   const betKey = `${uid}_${betId}`;
-
-  const wallet = await readWallet(
-    uid,
-    "BET_REQUEST"
-  );
-
-  if (!wallet.ok) return wallet;
-
-  const currentGame = (
-    await gameRef().once("value")
-  ).val();
-
-  if (
-    !validGame(currentGame) ||
-    currentGame.roundNumber !== roundNumber ||
-    currentPhase(currentGame) !== "betting"
-  ) {
+  if (!admission?.ok || admission.round !== roundNumber) {
     return errorResult("ROUND_CLOSED");
   }
+
+  // Admission was recorded on socket receipt, BEFORE slow token / wallet IO.
+  // A valid pre-deadline request may finish just after the clock hits zero.
+  const currentGame = (await gameRef().once("value")).val();
+  if (!validGame(currentGame) || currentGame.roundNumber !== roundNumber ||
+      historyArray(currentGame.history).some(
+        entry => Number(entry.roundNumber) === roundNumber
+      )) return errorResult("ROUND_CLOSED");
 
   let reserved;
 
@@ -825,7 +874,9 @@ async function placeBet(data) {
 
         if (
           current.roundNumber !== roundNumber ||
-          currentPhase(current) !== "betting"
+          historyArray(current.history).some(
+            entry => Number(entry.roundNumber) === roundNumber
+          )
         ) {
           reason = "ROUND_CLOSED";
           return;
@@ -840,22 +891,8 @@ async function placeBet(data) {
           return;
         }
 
-        const selected = new Set();
-
-        for (const bet of Object.values(activeBets)) {
-          if (bet.uid === uid) {
-            selected.add(Number(bet.foodIndex));
-          }
-        }
-
-        if (
-          !selected.has(foodIndex) &&
-          selected.size >= 6
-        ) {
-          reason = "MAX_SIX_SLOTS";
-          return;
-        }
-
+        // The player can bet on any of the eight slots, repeatedly.
+        // The wallet transaction is the only monetary limit.
         activeBets[betKey] = {
           uid,
           betId,
@@ -955,13 +992,7 @@ async function creditWinner(
 ) {
   const key = String(roundNumber);
 
-  const wallet = await readWallet(
-    uid,
-    "LION_PAYOUT"
-  );
-
-  if (!wallet.ok) return false;
-
+  // Idempotent credit: each uid/round has a single payout marker.
   const tx = await transactionReady(
     userRef(uid),
     user => {
@@ -1506,20 +1537,21 @@ io.on("connection", socket => {
   socket.on(
     "greedy_lion_place_bet",
     async (data, ack) => {
-      const reply =
-        typeof ack === "function"
-          ? ack
-          : () => {};
-
+      const reply = typeof ack === "function" ? ack : () => {};
+      const admission = admissionFor(data);
+      if (!admission.ok) {
+        reply(admission);
+        return;
+      }
+      beginIncoming(admission.round);
       try {
-        const result = await placeBet(data);
+        const result = await placeBet(data, admission);
         reply(result);
       } catch (error) {
-        console.error(
-          "SOCKET BET ERROR:",
-          error.message
-        );
-        reply(errorResult("SERVER_ERROR"));
+        console.error("SOCKET BET ERROR:", error.message);
+        reply(errorResult("BET_STATUS_UNCERTAIN"));
+      } finally {
+        endIncoming(admission.round);
       }
     }
   );
@@ -1597,6 +1629,7 @@ app.get("/", (req, res) => {
     roundEndsAt:
       game?.roundEndsAt ?? null,
     durationMs: ROUND_MS,
+    inFlightBets: incomingBets.get(Number(game?.roundNumber)) || 0,
     resultDurationMs: RESULT_MS,
     lastResult: history.length
       ? history[history.length - 1]
