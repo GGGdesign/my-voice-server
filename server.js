@@ -4,9 +4,9 @@
 const express = require("express");
 const http = require("http");
 const fs = require("fs");
+const crypto = require("crypto");
 const admin = require("firebase-admin");
 const { Server } = require("socket.io");
-const { attachGreedyLion } = require("./greedyLionGame");
 
 const app = express();
 const httpServer = http.createServer(app);
@@ -19,13 +19,20 @@ const io = new Server(httpServer, {
 app.use(express.json({ limit: "16kb" }));
 
 const PORT = Number(process.env.PORT || 10000);
-
 const DB_URL =
   "https://maxvoice-a5e31-default-rtdb.europe-west1.firebasedatabase.app";
+const SECRET_PATH = "/etc/secrets/firebase-service-account.json";
 
-const SECRET_PATH =
-  "/etc/secrets/firebase-service-account.json";
+const GAME_PATH = "greedyLionGame";
+const GAME_ROOM = "maxchat_greedy_lion_global";
+const BET_MS = 25000;
+const RESULT_MS = 6000;
+const CYCLE_MS = BET_MS + RESULT_MS;
+const MULTIPLIERS = [45, 5, 5, 10, 15, 5, 5, 25];
+const CHIPS = [100, 500, 1000, 5000, 10000];
 
+const BETTING_ENABLED =
+  process.env.LION_ENABLE_BETS !== "false";
 const GIFTS_ENABLED =
   process.env.MAXCHAT_ENABLE_GIFTS !== "false";
 
@@ -62,22 +69,18 @@ try {
   firebaseReady = true;
   console.log("FIREBASE READY");
 } catch (error) {
-  console.error(
-    "FIREBASE ERROR:",
-    error.message
-  );
+  console.error("FIREBASE ERROR:", error.message);
 }
 
 function db() {
   if (!firebaseReady) {
     throw new Error("FIREBASE_NOT_READY");
   }
-
   return admin.database();
 }
 
-const userRef = uid =>
-  db().ref("Users").child(uid);
+const gameRef = () => db().ref(GAME_PATH);
+const userRef = uid => db().ref("Users").child(uid);
 
 function validId(value) {
   return typeof value === "string" &&
@@ -90,14 +93,14 @@ function validRequestId(value) {
 }
 
 function validCoins(value) {
-  return Number.isSafeInteger(value) &&
-    value >= 0;
+  return Number.isSafeInteger(value) && value >= 0;
 }
 
 function errorResult(error) {
   return { ok: false, error };
 }
 
+// Initialize Firebase listener before transactions.
 async function transactionReady(ref, updater) {
   let listener = null;
 
@@ -113,9 +116,7 @@ async function transactionReady(ref, updater) {
       false
     );
   } finally {
-    if (listener) {
-      ref.off("value", listener);
-    }
+    if (listener) ref.off("value", listener);
   }
 }
 
@@ -129,10 +130,7 @@ async function verifyToken(token) {
   }
 
   try {
-    return await admin.auth().verifyIdToken(
-      token,
-      true
-    );
+    return await admin.auth().verifyIdToken(token, true);
   } catch {
     throw new Error("INVALID_TOKEN");
   }
@@ -145,9 +143,7 @@ async function verifyHttpUser(req) {
 
   const match = /^Bearer\s+(.+)$/i.exec(header);
 
-  if (!match) {
-    throw new Error("TOKEN_REQUIRED");
-  }
+  if (!match) throw new Error("TOKEN_REQUIRED");
 
   return verifyToken(match[1]);
 }
@@ -157,15 +153,13 @@ async function readWallet(uid, operation) {
     return errorResult("INVALID_UID");
   }
 
-  const snapshot =
-    await userRef(uid).once("value");
+  const snapshot = await userRef(uid).once("value");
 
   if (!snapshot.exists()) {
     console.error("USER NOT FOUND:", {
       operation,
       uid
     });
-
     return errorResult("USER_NOT_FOUND");
   }
 
@@ -181,13 +175,123 @@ async function readWallet(uid, operation) {
     return errorResult("INVALID_WALLET");
   }
 
+  return { ok: true, uid, coins, user };
+}
+
+// ==================================================
+// GAME STATE
+// ==================================================
+
+let game = null;
+let gameStarted = false;
+let roundProcessing = false;
+let settlementProcessing = false;
+let lastRoundResult = null;
+
+function validGame(value) {
+  return Boolean(
+    value &&
+    Number.isSafeInteger(value.roundNumber) &&
+    value.roundNumber > 0 &&
+    Number.isFinite(Number(value.roundStartsAt)) &&
+    Number.isFinite(Number(value.roundEndsAt))
+  );
+}
+
+function historyArray(value) {
+  if (Array.isArray(value)) {
+    return value.filter(Boolean).slice(-8);
+  }
+
+  if (value && typeof value === "object") {
+    return Object.values(value)
+      .filter(Boolean)
+      .sort(
+        (a, b) =>
+          Number(a.roundNumber || 0) -
+          Number(b.roundNumber || 0)
+      )
+      .slice(-8);
+  }
+
+  return [];
+}
+
+function cycleEnd(value) {
+  return Number(value?.cycleEndsAt ||
+    (Number(value?.roundEndsAt || 0) + RESULT_MS));
+}
+
+function gamePhase(value, now = Date.now()) {
+  if (!validGame(value)) return "waiting";
+  return now < Number(value.roundEndsAt) ? "betting" : "result";
+}
+
+function secondsUntil(end) {
+  return Math.max(0, Math.ceil((Number(end) - Date.now()) / 1000));
+}
+
+function createGame(now) {
   return {
-    ok: true,
-    uid,
-    coins,
-    user
+    roundNumber: 1,
+    roundStartsAt: now,
+    roundEndsAt: now + BET_MS,
+    cycleEndsAt: now + CYCLE_MS,
+    activeBets: {},
+    pendingSettlement: {},
+    history: []
   };
 }
+
+function remaining() {
+  if (!game) return null;
+  return secondsUntil(gamePhase(game) === "betting"
+    ? game.roundEndsAt : cycleEnd(game));
+}
+
+function publicState() {
+  const phase = gamePhase(game);
+  return {
+    roundNumber: game?.roundNumber ?? null,
+    roundStartsAt: game?.roundStartsAt ?? null,
+    roundEndsAt: game?.roundEndsAt ?? null,
+    cycleEndsAt: game ? cycleEnd(game) : null,
+    serverTime: Date.now(),
+    secondsRemaining: remaining(),
+    bettingEnabled: firebaseReady && BETTING_ENABLED && phase === "betting",
+    phase,
+    multipliers: MULTIPLIERS,
+    history: historyArray(game?.history)
+  };
+}
+
+function sendState() {
+  if (!game) return;
+
+  io.to(GAME_ROOM).emit(
+    "greedy_lion_state",
+    publicState()
+  );
+}
+
+function sendClock() {
+  if (!game) return;
+  const state = publicState();
+  io.to(GAME_ROOM).emit("greedy_lion_clock", {
+    roundNumber: state.roundNumber,
+    roundStartsAt: state.roundStartsAt,
+    roundEndsAt: state.roundEndsAt,
+    cycleEndsAt: state.cycleEndsAt,
+    serverTime: state.serverTime,
+    secondsRemaining: state.secondsRemaining,
+    bettingEnabled: state.bettingEnabled,
+    phase: state.phase
+  });
+}
+
+// ==================================================
+// WINNER PROFILE
+// ==================================================
 
 function profileName(user) {
   return String(
@@ -199,9 +303,779 @@ function profileName(user) {
   );
 }
 
-// =====================================
+function profilePhoto(user) {
+  return String(
+    user?.profileImage ||
+    user?.profileImageUrl ||
+    user?.photoUrl ||
+    user?.photoURL ||
+    user?.avatarUrl ||
+    user?.avatar ||
+    user?.imageUrl ||
+    ""
+  );
+}
+
+function calculatePayouts(entry) {
+  const totals = {};
+  const winner = Number(entry.winningIndex);
+
+  for (const bet of Object.values(entry.bets || {})) {
+    const uid = bet.uid;
+    const index = Number(bet.foodIndex);
+    const amount = Number(bet.amount);
+
+    if (
+      !validId(uid) ||
+      index !== winner ||
+      !validCoins(amount) ||
+      amount === 0
+    ) {
+      continue;
+    }
+
+    const payout = amount * MULTIPLIERS[index];
+
+    if (!validCoins(payout)) continue;
+
+    const next = (totals[uid] || 0) + payout;
+
+    if (!validCoins(next)) continue;
+
+    totals[uid] = next;
+  }
+
+  return totals;
+}
+
+async function buildWinnerDetails(entry) {
+  const totals = calculatePayouts(entry);
+  const ordered = Object.entries(totals)
+    .sort((a, b) => b[1] - a[1]);
+
+  const winners = await Promise.all(
+    ordered.map(async ([uid, amount], position) => {
+      let user = {};
+
+      if (position < 3) {
+        try {
+          const snapshot = await userRef(uid).once("value");
+          user = snapshot.val() || {};
+        } catch (error) {
+          console.error("WINNER PROFILE ERROR:", uid, error.message);
+        }
+      }
+
+      const name = position < 3 ? profileName(user) : "مستخدم";
+      const photoUrl = position < 3 ? profilePhoto(user) : "";
+
+      return {
+        rank: position + 1,
+        uid,
+        userUid: uid,
+        userId: String(user.customId || user.userId || ""),
+        name,
+        userName: name,
+        photoUrl,
+        avatarUrl: photoUrl,
+        amount,
+        payout: amount,
+        winnings: amount,
+        winningIndex: Number(entry.winningIndex)
+      };
+    })
+  );
+
+  return winners;
+}
+
+async function publishRoundWinners(entry) {
+  const roundNumber = Number(entry.roundNumber);
+  const winners = await buildWinnerDetails(entry);
+  const result = {
+    roundNumber,
+    winningIndex: Number(entry.winningIndex),
+    completedAt: Number(entry.completedAt),
+    hasSettledBets: true,
+    winners,
+    topWinners: winners.slice(0, 3)
+  };
+
+  const tx = await transactionReady(gameRef(), current => {
+    if (!validGame(current)) return;
+    const history = historyArray(current.history);
+    const index = history.findIndex(
+      item => Number(item.roundNumber) === roundNumber
+    );
+    if (index < 0) return;
+    history[index] = { ...history[index], ...result };
+    // Old results keep scores, names and ranks but not huge base64 photos.
+    const compact = history.map(item => {
+      if (Number(item.roundNumber) === roundNumber) return item;
+      const minimize = list => Array.isArray(list) ? list.map(w => {
+        const { photoUrl, avatarUrl, ...rest } = w;
+        return rest;
+      }) : list;
+      return {
+        ...item,
+        winners: minimize(item.winners),
+        topWinners: minimize(item.topWinners)
+      };
+    });
+    return { ...current, history: compact };
+  });
+
+  const saved = historyArray(tx.snapshot.val()?.history).find(
+    item => Number(item.roundNumber) === roundNumber
+  );
+  if (!saved || !saved.hasSettledBets) {
+    throw new Error("WINNER_HISTORY_NOT_SAVED");
+  }
+
+  io.to(GAME_ROOM).emit("greedy_lion_winners", result);
+  io.to(GAME_ROOM).emit("greedy_lion_round_result", result);
+  return result;
+}
+
+// ==================================================
+// GAME START
+// ==================================================
+
+async function startGame() {
+  if (!firebaseReady || gameStarted) return;
+  gameStarted = true;
+  try {
+    const ref = gameRef();
+    const snapshot = await ref.once("value");
+    if (!snapshot.exists()) {
+      await transactionReady(ref, current => {
+        if (current !== null) return;
+        return createGame(Date.now());
+      });
+    }
+    ref.on("value", snapshot => {
+      const saved = snapshot.val();
+      if (!validGame(saved)) {
+        console.error("INVALID GAME STATE");
+        return;
+      }
+      game = saved;
+      sendState();
+    }, error => {
+      console.error("GAME LISTENER ERROR:", error.message);
+    });
+    console.log("GAME LISTENER STARTED");
+  } catch (error) {
+    gameStarted = false;
+    console.error("START GAME ERROR:", error.message);
+  }
+}
+
+// ==================================================
+// ROUND ADVANCE
+// ==================================================
+
+async function advanceGame() {
+  if (!firebaseReady || !game || roundProcessing) return;
+  roundProcessing = true;
+  try {
+    const now = Date.now();
+    const winningIndex = crypto.randomInt(8);
+    const tx = await transactionReady(gameRef(), current => {
+      if (!validGame(current)) return;
+      if (Date.now() < Number(current.roundEndsAt)) return;
+      const roundNumber = current.roundNumber;
+      const history = historyArray(current.history);
+      // Close once. Multiple Render timers/retries must not choose a new winner.
+      if (history.some(item => Number(item.roundNumber) === roundNumber)) return;
+      const bets = current.activeBets || {};
+      const pending = { ...(current.pendingSettlement || {}) };
+      const empty = Object.keys(bets).length === 0;
+      const result = {
+        roundNumber,
+        winningIndex,
+        completedAt: now,
+        hasSettledBets: empty,
+        winners: [],
+        topWinners: []
+      };
+      if (!empty) {
+        pending[String(roundNumber)] = {
+          roundNumber,
+          winningIndex,
+          completedAt: now,
+          payoutVersion: 2,
+          settled: false,
+          bets
+        };
+      }
+      return {
+        ...current,
+        cycleEndsAt: cycleEnd(current),
+        pendingSettlement: pending,
+        history: [...history, result].slice(-8)
+        // activeBets deliberately remain until the NEW round starts.
+        // This prevents a displayed bet from vanishing during the result.
+      };
+    });
+    if (!tx.committed) return;
+    game = tx.snapshot.val();
+    const result = historyArray(game.history).find(
+      item => Number(item.roundNumber) === Number(game.roundNumber)
+    );
+    if (result) io.to(GAME_ROOM).emit("greedy_lion_round_result", result);
+    sendState();
+    sendClock();
+    setImmediate(() => settlePending().catch(error => {
+      console.error("IMMEDIATE SETTLEMENT ERROR:", error.message);
+    }));
+  } catch (error) {
+    console.error("ADVANCE GAME ERROR:", error.message);
+  } finally {
+    roundProcessing = false;
+  }
+}
+
+// The result phase is a real server phase: do not reset bets before it ends.
+async function startNextRound() {
+  if (!firebaseReady || !game || roundProcessing) return;
+  roundProcessing = true;
+  try {
+    const now = Date.now();
+    const tx = await transactionReady(gameRef(), current => {
+      if (!validGame(current)) return;
+      if (Date.now() < cycleEnd(current)) return;
+      const currentRound = Number(current.roundNumber);
+      if (!historyArray(current.history).some(
+        item => Number(item.roundNumber) === currentRound
+      )) return;
+      return {
+        ...current,
+        roundNumber: currentRound + 1,
+        roundStartsAt: now,
+        roundEndsAt: now + BET_MS,
+        cycleEndsAt: now + CYCLE_MS,
+        activeBets: {}
+      };
+    });
+    if (tx.committed) {
+      game = tx.snapshot.val();
+      sendState();
+      sendClock();
+    }
+  } catch (error) {
+    console.error("NEXT ROUND ERROR:", error.message);
+  } finally {
+    roundProcessing = false;
+  }
+}
+
+// ==================================================
+// BET RESERVATION
+// ==================================================
+
+async function reserveCoins(
+  uid,
+  betId,
+  amount,
+  roundNumber,
+  foodIndex
+) {
+  let reason = "WALLET_REJECTED";
+
+  const tx = await transactionReady(
+    userRef(uid),
+    user => {
+      if (!user) {
+        reason = "USER_NOT_FOUND";
+        return;
+      }
+
+      const bets = user.lionBets || {};
+
+      if (bets[betId]) {
+        reason = "DUPLICATE_BET";
+        return;
+      }
+
+      const coins = Number(user.coins);
+
+      if (!validCoins(coins)) {
+        reason = "INVALID_WALLET";
+        return;
+      }
+
+      if (coins < amount) {
+        reason = "INSUFFICIENT_COINS";
+        return;
+      }
+
+      return {
+        ...user,
+        coins: coins - amount,
+        lionBets: {
+          ...bets,
+          [betId]: {
+            amount,
+            roundNumber,
+            foodIndex,
+            status: "reserved",
+            createdAt: Date.now()
+          }
+        }
+      };
+    }
+  );
+
+  if (!tx.committed) {
+    return errorResult(reason);
+  }
+
+  return {
+    ok: true,
+    balance: Number(tx.snapshot.val()?.coins)
+  };
+}
+
+async function setBetStatus(uid, betId, status) {
+  const tx = await transactionReady(
+    userRef(uid),
+    user => {
+      const bet = user?.lionBets?.[betId];
+
+      if (!bet) return;
+      if (bet.status === status) return;
+      if (bet.status !== "reserved") return;
+
+      return {
+        ...user,
+        lionBets: {
+          ...user.lionBets,
+          [betId]: {
+            ...bet,
+            status,
+            updatedAt: Date.now()
+          }
+        }
+      };
+    }
+  );
+
+  return Boolean(
+    tx.committed ||
+    tx.snapshot.val()?.lionBets?.[betId]
+      ?.status === status
+  );
+}
+
+async function refundBet(uid, betId) {
+  const tx = await transactionReady(
+    userRef(uid),
+    user => {
+      const bet = user?.lionBets?.[betId];
+
+      if (!bet) return;
+      if (bet.status === "refunded") return;
+      if (bet.status !== "reserved") return;
+
+      const amount = Number(bet.amount);
+      const coins = Number(user.coins);
+
+      if (
+        !validCoins(amount) ||
+        !validCoins(coins) ||
+        !Number.isSafeInteger(coins + amount)
+      ) return;
+
+      return {
+        ...user,
+        coins: coins + amount,
+        lionBets: {
+          ...user.lionBets,
+          [betId]: {
+            ...bet,
+            status: "refunded",
+            refundedAt: Date.now()
+          }
+        }
+      };
+    }
+  );
+
+  return Boolean(
+    tx.committed ||
+    tx.snapshot.val()?.lionBets?.[betId]
+      ?.status === "refunded"
+  );
+}
+
+async function placeBet(data) {
+  if (!BETTING_ENABLED) {
+    return errorResult("BETTING_DISABLED");
+  }
+
+  if (!firebaseReady || !game) {
+    return errorResult("SERVER_NOT_READY");
+  }
+
+  const token = String(data?.idToken || "");
+  const betId = String(data?.betId || "");
+
+  const foodIndex = Number(data?.foodIndex);
+  const amount = Number(data?.amount);
+  const roundNumber = Number(data?.roundNumber);
+
+  if (
+    !/^[a-f0-9]{32}$/i.test(betId) ||
+    !Number.isInteger(foodIndex) ||
+    foodIndex < 0 ||
+    foodIndex > 7 ||
+    !CHIPS.includes(amount) ||
+    !Number.isSafeInteger(roundNumber)
+  ) {
+    return errorResult("INVALID_BET");
+  }
+
+  let decoded;
+
+  try {
+    decoded = await verifyToken(token);
+  } catch (error) {
+    return errorResult(error.message);
+  }
+
+  const uid = decoded.uid;
+  const betKey = `${uid}_${betId}`;
+
+  const currentGame = (
+    await gameRef().once("value")
+  ).val();
+
+  if (
+    !validGame(currentGame) ||
+    currentGame.roundNumber !== roundNumber ||
+    gamePhase(currentGame) !== "betting"
+  ) {
+    return errorResult("ROUND_CLOSED");
+  }
+
+  // Fast validation before touching the wallet; root transaction checks again.
+  const selectedBeforeReserve = new Set(
+    Object.values(currentGame.activeBets || {})
+      .filter(bet => bet.uid === uid)
+      .map(bet => Number(bet.foodIndex))
+  );
+  if (!selectedBeforeReserve.has(foodIndex) && selectedBeforeReserve.size >= 6) {
+    return errorResult("MAX_SIX_SLOTS");
+  }
+
+  let reserved;
+
+  try {
+    reserved = await reserveCoins(
+      uid,
+      betId,
+      amount,
+      roundNumber,
+      foodIndex
+    );
+  } catch (error) {
+    console.error(
+      "BET WALLET ERROR:",
+      error.message
+    );
+    return errorResult("WALLET_ERROR");
+  }
+
+  if (!reserved.ok) return reserved;
+
+  let reason = "BET_REJECTED";
+
+  try {
+    const tx = await transactionReady(
+      gameRef(),
+      current => {
+        if (!validGame(current)) {
+          reason = "GAME_NOT_READY";
+          return;
+        }
+
+        if (
+          current.roundNumber !== roundNumber ||
+          gamePhase(current) !== "betting"
+        ) {
+          reason = "ROUND_CLOSED";
+          return;
+        }
+
+        const activeBets = {
+          ...(current.activeBets || {})
+        };
+
+        if (activeBets[betKey]) {
+          reason = "DUPLICATE_BET";
+          return;
+        }
+
+        const selected = new Set();
+
+        for (const bet of Object.values(activeBets)) {
+          if (bet.uid === uid) {
+            selected.add(Number(bet.foodIndex));
+          }
+        }
+
+        if (
+          !selected.has(foodIndex) &&
+          selected.size >= 6
+        ) {
+          reason = "MAX_SIX_SLOTS";
+          return;
+        }
+
+        activeBets[betKey] = {
+          uid,
+          betId,
+          foodIndex,
+          amount,
+          roundNumber,
+          createdAt: Date.now()
+        };
+
+        return {
+          ...current,
+          activeBets
+        };
+      }
+    );
+
+    if (!tx.committed) {
+      const refunded = await refundBet(uid, betId);
+
+      return errorResult(
+        refunded ? reason : "REFUND_PENDING"
+      );
+    }
+
+    game = tx.snapshot.val();
+
+    try {
+      await setBetStatus(uid, betId, "accepted");
+    } catch (error) {
+      console.error(
+        "BET STATUS ERROR:",
+        error.message
+      );
+    }
+
+    return {
+      ok: true,
+      betId,
+      foodIndex,
+      amount,
+      roundNumber,
+      balance: reserved.balance
+    };
+  } catch (error) {
+    console.error(
+      "BET TRANSACTION ERROR:",
+      error.message
+    );
+
+    try {
+      const saved = (
+        await gameRef().once("value")
+      ).val();
+
+      const inActive = Boolean(
+        saved?.activeBets?.[betKey]
+      );
+
+      const inPending = Object.values(
+        saved?.pendingSettlement || {}
+      ).some(
+        entry => Boolean(entry?.bets?.[betKey])
+      );
+
+      if (inActive || inPending) {
+        return {
+          ok: true,
+          betId,
+          foodIndex,
+          amount,
+          roundNumber,
+          balance: reserved.balance
+        };
+      }
+
+      const refunded = await refundBet(uid, betId);
+
+      return errorResult(
+        refunded
+          ? "BET_FAILED_REFUNDED"
+          : "BET_STATUS_UNCERTAIN"
+      );
+    } catch {
+      return errorResult("BET_STATUS_UNCERTAIN");
+    }
+  }
+}
+
+// ==================================================
+// PAYOUTS
+// ==================================================
+
+async function creditWinner(
+  uid,
+  roundNumber,
+  amount
+) {
+  const key = String(roundNumber);
+
+  const wallet = await readWallet(
+    uid,
+    "LION_PAYOUT"
+  );
+
+  if (!wallet.ok) return false;
+
+  const tx = await transactionReady(
+    userRef(uid),
+    user => {
+      if (!user) return;
+
+      const payouts = user.lionPayouts || {};
+
+      if (payouts[key]) return;
+
+      const coins = Number(user.coins);
+
+      if (
+        !validCoins(coins) ||
+        !validCoins(amount) ||
+        amount === 0 ||
+        !Number.isSafeInteger(coins + amount)
+      ) return;
+
+      return {
+        ...user,
+        coins: coins + amount,
+        lionPayouts: {
+          ...payouts,
+          [key]: {
+            amount,
+            completedAt: Date.now()
+          }
+        }
+      };
+    }
+  );
+
+  return Boolean(
+    tx.committed ||
+    tx.snapshot.val()?.lionPayouts?.[key]
+  );
+}
+
+async function settlePending() {
+  if (
+    !firebaseReady ||
+    !game ||
+    settlementProcessing
+  ) return;
+
+  settlementProcessing = true;
+
+  try {
+    const snapshot = await gameRef()
+      .child("pendingSettlement")
+      .once("value");
+
+    const pending = snapshot.val() || {};
+
+    for (const [key, entry] of Object.entries(pending)) {
+      if (!entry) continue;
+
+      if (
+        entry.payoutVersion !== 1 &&
+        entry.payoutVersion !== 2
+      ) continue;
+
+      if (!entry.settled) {
+      const totals = calculatePayouts(entry);
+      let allPaid = true;
+
+      for (const [uid, amount] of Object.entries(totals)) {
+        try {
+          const paid = await creditWinner(
+            uid,
+            entry.roundNumber,
+            amount
+          );
+
+          if (!paid) allPaid = false;
+        } catch (error) {
+          allPaid = false;
+          console.error(
+            "PAYOUT ERROR:",
+            error.message
+          );
+        }
+      }
+
+      if (!allPaid) continue;
+
+      // Save settlement first. Winner presentation can
+      // be retried independently without double payment.
+      await gameRef()
+        .child("pendingSettlement")
+        .child(key)
+        .update({
+          settled: true,
+          settledAt: Date.now()
+        });
+      }
+
+      // Payment is idempotent; retry result publishing without paying again.
+      const historySnapshot = await gameRef().child("history").once("value");
+      const published = historyArray(historySnapshot.val()).some(
+        item => Number(item.roundNumber) === Number(entry.roundNumber) &&
+          item.hasSettledBets === true
+      );
+      if (published) {
+        if (entry.settled) {
+          await gameRef().child("pendingSettlement").child(key).remove();
+        }
+        continue;
+      }
+      try {
+        await publishRoundWinners(entry);
+        // Ledger keeps paid-round IDs; published results live in history.
+        // Removing the processed round keeps root-game transactions fast.
+        const settledSnap = await gameRef()
+          .child("pendingSettlement").child(key).once("value");
+        if (settledSnap.val()?.settled === true) {
+          await gameRef().child("pendingSettlement").child(key).remove();
+        }
+      } catch (error) {
+        console.error("WINNER DISPLAY ERROR:", error.message);
+      }
+
+      console.log("ROUND SETTLED:", key);
+    }
+  } catch (error) {
+    console.error(
+      "SETTLEMENT ERROR:",
+      error.message
+    );
+  } finally {
+    settlementProcessing = false;
+  }
+}
+
+// ==================================================
 // GIFTS
-// =====================================
+// ==================================================
 
 function sameGiftPayment(payment, request) {
   return Boolean(
@@ -252,9 +1126,7 @@ async function chargeGift(uid, request) {
     "GIFT_SEND"
   );
 
-  if (!wallet.ok) {
-    return wallet;
-  }
+  if (!wallet.ok) return wallet;
 
   let reason = "PAYMENT_REJECTED";
 
@@ -266,20 +1138,13 @@ async function chargeGift(uid, request) {
         return;
       }
 
-      const payments =
-        user.giftPayments || {};
-
-      const previous =
-        payments[request.requestId];
+      const payments = user.giftPayments || {};
+      const previous = payments[request.requestId];
 
       if (previous) {
-        reason = sameGiftPayment(
-          previous,
-          request
-        )
+        reason = sameGiftPayment(previous, request)
           ? "ALREADY_PAID"
           : "REQUEST_ID_CONFLICT";
-
         return;
       }
 
@@ -315,7 +1180,6 @@ async function chargeGift(uid, request) {
   );
 
   const saved = tx.snapshot.val();
-
   const payment =
     saved?.giftPayments?.[request.requestId];
 
@@ -333,13 +1197,8 @@ async function chargeGift(uid, request) {
   };
 }
 
-async function publishGift(
-  uid,
-  request,
-  payment
-) {
-  const eventId =
-    `${uid}_${request.requestId}`;
+async function publishGift(uid, request, payment) {
+  const eventId = `${uid}_${request.requestId}`;
 
   const event = {
     requestId: request.requestId,
@@ -360,10 +1219,7 @@ async function publishGift(
     .child(eventId);
 
   await transactionReady(ref, current => {
-    if (current !== null) {
-      return;
-    }
-
+    if (current !== null) return;
     return event;
   });
 
@@ -403,19 +1259,11 @@ app.get("/api/gifts/catalog", (req, res) => {
 
 app.post("/api/gifts/send", async (req, res) => {
   if (!firebaseReady) {
-    return giftError(
-      res,
-      503,
-      "SERVER_NOT_READY"
-    );
+    return giftError(res, 503, "SERVER_NOT_READY");
   }
 
   if (!GIFTS_ENABLED) {
-    return giftError(
-      res,
-      503,
-      "GIFTS_DISABLED"
-    );
+    return giftError(res, 503, "GIFTS_DISABLED");
   }
 
   let decoded;
@@ -423,27 +1271,14 @@ app.post("/api/gifts/send", async (req, res) => {
   try {
     decoded = await verifyHttpUser(req);
   } catch (error) {
-    return giftError(
-      res,
-      401,
-      error.message
-    );
+    return giftError(res, 401, error.message);
   }
 
   const uid = decoded.uid;
-
-  const roomId =
-    String(req.body?.roomId || "");
-
-  const giftId =
-    String(req.body?.giftId || "");
-
-  const receiverId =
-    String(req.body?.receiverId || "");
-
-  const requestId =
-    String(req.body?.requestId || "");
-
+  const roomId = String(req.body?.roomId || "");
+  const giftId = String(req.body?.giftId || "");
+  const receiverId = String(req.body?.receiverId || "");
+  const requestId = String(req.body?.requestId || "");
   const quantity = req.body?.quantity;
 
   if (
@@ -465,25 +1300,16 @@ app.post("/api/gifts/send", async (req, res) => {
   const gift = GIFTS[giftId];
 
   if (!gift) {
-    return giftError(
-      res,
-      400,
-      "UNKNOWN_GIFT"
-    );
+    return giftError(res, 400, "UNKNOWN_GIFT");
   }
 
-  const amount =
-    gift.price * quantity;
+  const amount = gift.price * quantity;
 
   if (
     !validCoins(amount) ||
     amount === 0
   ) {
-    return giftError(
-      res,
-      400,
-      "INVALID_AMOUNT"
-    );
+    return giftError(res, 400, "INVALID_AMOUNT");
   }
 
   const request = {
@@ -502,23 +1328,14 @@ app.post("/api/gifts/send", async (req, res) => {
     );
 
     if (!wallet.ok) {
-      return giftError(
-        res,
-        409,
-        wallet.error
-      );
+      return giftError(res, 409, wallet.error);
     }
 
     const previous =
       wallet.user.giftPayments?.[requestId];
 
     if (previous) {
-      if (
-        !sameGiftPayment(
-          previous,
-          request
-        )
-      ) {
+      if (!sameGiftPayment(previous, request)) {
         return giftError(
           res,
           409,
@@ -526,11 +1343,10 @@ app.post("/api/gifts/send", async (req, res) => {
         );
       }
     } else {
-      const exists =
-        await giftReceiverOnSeat(
-          roomId,
-          receiverId
-        );
+      const exists = await giftReceiverOnSeat(
+        roomId,
+        receiverId
+      );
 
       if (!exists) {
         return giftError(
@@ -556,11 +1372,7 @@ app.post("/api/gifts/send", async (req, res) => {
       );
     }
 
-    await publishGift(
-      uid,
-      request,
-      payment
-    );
+    await publishGift(uid, request, payment);
 
     return res.json({
       ok: true,
@@ -587,159 +1399,239 @@ app.post("/api/gifts/send", async (req, res) => {
   }
 });
 
-// =====================================
-// VOICE + ROOMS
-// =====================================
+// ==================================================
+// VOICE + SOCKET
+// ==================================================
 
 io.on("connection", socket => {
-  console.log(
-    "USER CONNECTED:",
-    socket.id
-  );
+  console.log("USER CONNECTED:", socket.id);
 
   socket.on("join_room", data => {
-    if (!data?.roomId) {
-      return;
-    }
+    if (!data?.roomId) return;
 
-    socket.join(
-      String(data.roomId)
+    socket.join(String(data.roomId));
+
+    socket.to(String(data.roomId)).emit(
+      "user_joined_room",
+      {
+        userId: data.userId,
+        userName: data.userName
+      }
     );
-
-    socket.to(
-      String(data.roomId)
-    ).emit("user_joined_room", {
-      userId: data.userId,
-      userName: data.userName
-    });
   });
 
   socket.on("toggle_mute", data => {
-    if (!data?.roomId) {
-      return;
-    }
+    if (!data?.roomId) return;
 
-    io.to(
-      String(data.roomId)
-    ).emit("user_toggle_mute", {
-      userId: data.userId,
-      isMuted: data.isMuted
-    });
+    io.to(String(data.roomId)).emit(
+      "user_toggle_mute",
+      {
+        userId: data.userId,
+        isMuted: data.isMuted
+      }
+    );
   });
 
   socket.on("sit_on_seat", data => {
-    if (!data?.roomId) {
-      return;
-    }
+    if (!data?.roomId) return;
 
-    io.to(
-      String(data.roomId)
-    ).emit("user_sat_on_seat", {
-      userId: data.userId,
-      seatIndex: data.seatIndex
-    });
+    io.to(String(data.roomId)).emit(
+      "user_sat_on_seat",
+      {
+        userId: data.userId,
+        seatIndex: data.seatIndex
+      }
+    );
   });
 
   socket.on("leave_seat", data => {
-    if (!data?.roomId) {
-      return;
-    }
+    if (!data?.roomId) return;
 
-    io.to(
-      String(data.roomId)
-    ).emit("user_left_seat", {
-      userId: data.userId
-    });
+    io.to(String(data.roomId)).emit(
+      "user_left_seat",
+      { userId: data.userId }
+    );
   });
 
   socket.on("start_audio_stream", data => {
-    if (!data?.roomId) {
-      return;
-    }
+    if (!data?.roomId) return;
 
-    socket.to(
-      String(data.roomId)
-    ).emit("user_started_audio", {
-      userId: data.userId
-    });
+    socket.to(String(data.roomId)).emit(
+      "user_started_audio",
+      { userId: data.userId }
+    );
   });
 
   socket.on("stop_audio_stream", data => {
-    if (!data?.roomId) {
-      return;
-    }
+    if (!data?.roomId) return;
 
-    socket.to(
-      String(data.roomId)
-    ).emit("user_stopped_audio", {
-      userId: data.userId
-    });
+    socket.to(String(data.roomId)).emit(
+      "user_stopped_audio",
+      { userId: data.userId }
+    );
   });
 
   socket.on("voice_data", data => {
-    if (!data?.roomId) {
-      return;
+    if (!data?.roomId) return;
+
+    socket.to(String(data.roomId)).emit(
+      "voice_data",
+      {
+        audioBuffer: data.audioBuffer,
+        userId: data.userId
+      }
+    );
+  });
+
+  socket.on("greedy_lion_join", async () => {
+    socket.join(GAME_ROOM);
+
+    if (!game) {
+      await startGame();
     }
 
-    socket.to(
-      String(data.roomId)
-    ).emit("voice_data", {
-      audioBuffer: data.audioBuffer,
-      userId: data.userId
+    if (!socket.connected || !game) return;
+
+    socket.emit(
+      "greedy_lion_state",
+      publicState()
+    );
+
+    socket.emit("greedy_lion_clock", {
+      roundNumber: game.roundNumber,
+      roundStartsAt: game.roundStartsAt,
+      roundEndsAt: game.roundEndsAt,
+      cycleEndsAt: cycleEnd(game),
+      serverTime: Date.now(),
+      secondsRemaining: remaining(),
+      bettingEnabled: publicState().bettingEnabled,
+      phase: gamePhase(game)
     });
   });
 
+  socket.on(
+    "greedy_lion_place_bet",
+    async (data, ack) => {
+      const reply =
+        typeof ack === "function"
+          ? ack
+          : () => {};
+
+      try {
+        const result = await placeBet(data);
+        reply(result);
+      } catch (error) {
+        console.error(
+          "SOCKET BET ERROR:",
+          error.message
+        );
+        reply(errorResult("SERVER_ERROR"));
+      }
+    }
+  );
+
+  socket.on("greedy_lion_leave", () => {
+    socket.leave(GAME_ROOM);
+  });
+
   socket.on("disconnect", () => {
-    console.log(
-      "USER DISCONNECTED:",
-      socket.id
-    );
+    console.log("USER DISCONNECTED:", socket.id);
   });
 });
 
-// =====================================
-// GAME MODULE
-// =====================================
+// ==================================================
+// TIMERS
+// ==================================================
 
-attachGreedyLion({
-  app,
-  io,
-  admin,
-  firebaseReady
-});
+let gameTimerBusy = false;
+setInterval(async () => {
+  if (!firebaseReady) return;
+  if (!game) {
+    await startGame();
+    return;
+  }
+  sendClock();
+  if (gameTimerBusy) return;
+  gameTimerBusy = true;
+  try {
+    const recorded = historyArray(game.history).some(
+      item => Number(item.roundNumber) === Number(game.roundNumber)
+    );
+    if (Date.now() >= Number(game.roundEndsAt) && !recorded) {
+      await advanceGame();
+    }
+    const recordedNow = historyArray(game.history).some(
+      item => Number(item.roundNumber) === Number(game.roundNumber)
+    );
+    if (Date.now() >= cycleEnd(game) && recordedNow) {
+      await startNextRound();
+    }
+  } catch (error) {
+    console.error("GAME TIMER ERROR:", error.message);
+  } finally {
+    gameTimerBusy = false;
+  }
+}, 500);
 
-// =====================================
+setInterval(() => {
+  settlePending().catch(error => console.error("SETTLEMENT TIMER ERROR:", error.message));
+}, 1000);
+
+// ==================================================
 // HEALTH
-// =====================================
+// ==================================================
 
 app.get("/", (req, res) => {
+  const history = historyArray(game?.history);
+
   res.json({
     app: "Max Chat",
+    game: "Greedy Lion",
     status: "online",
-    service: "voice_rooms_and_gifts",
     firebaseReady,
+    bettingEnabled:
+      firebaseReady && BETTING_ENABLED,
     giftsEnabled:
-      firebaseReady && GIFTS_ENABLED
+      firebaseReady && GIFTS_ENABLED,
+    roundNumber: game?.roundNumber ?? null,
+    secondsRemaining: remaining(),
+    phase: gamePhase(game),
+    roundStartsAt:
+      game?.roundStartsAt ?? null,
+    roundEndsAt:
+      game?.roundEndsAt ?? null,
+    cycleEndsAt: game ? cycleEnd(game) : null,
+    bettingDurationMs: BET_MS,
+    resultDurationMs: RESULT_MS,
+    lastResult: history.length
+      ? history[history.length - 1]
+      : null
   });
 });
 
-// =====================================
+// ==================================================
 // START
-// =====================================
+// ==================================================
 
-httpServer.listen(PORT, () => {
-  console.log(
-    "MAX CHAT SERVER RUNNING:",
-    PORT
-  );
+httpServer.listen(PORT, async () => {
+  console.log("MAX CHAT SERVER RUNNING:", PORT);
+  console.log("BETTING ENABLED:", BETTING_ENABLED);
+  console.log("GIFTS ENABLED:", GIFTS_ENABLED);
+
+  await startGame();
+
+  if (game && Date.now() >= Number(game.roundEndsAt)) {
+    const recorded = historyArray(game.history).some(
+      item => Number(item.roundNumber) === Number(game.roundNumber)
+    );
+    if (!recorded) await advanceGame();
+    if (Date.now() >= cycleEnd(game)) await startNextRound();
+  }
+
+  settlePending().catch(error => console.error("STARTUP SETTLEMENT ERROR:", error.message));
 
   console.log(
-    "FIREBASE READY:",
-    firebaseReady
-  );
-
-  console.log(
-    "GIFTS ENABLED:",
-    GIFTS_ENABLED
+    "GAME READY:",
+    game?.roundNumber ?? "NOT READY"
   );
 });
