@@ -27,6 +27,7 @@ const GAME_PATH = "greedyLionGame";
 const GAME_ROOM = "maxchat_greedy_lion_global";
 const ROUND_MS = 25000;
 const RESULT_MS = 6000;
+const FINALIZE_MS = 1700; // complete taps received before the countdown reached zero
 const MULTIPLIERS = [45, 5, 5, 10, 15, 5, 5, 25];
 const CHIPS = [100, 500, 1000, 5000, 10000];
 
@@ -99,24 +100,10 @@ function errorResult(error) {
   return { ok: false, error };
 }
 
-// Initialize Firebase listener before transactions.
+// Firebase Realtime Database transaction is atomic. Do not open a second
+// value listener before every debit; it added avoidable network latency.
 async function transactionReady(ref, updater) {
-  let listener = null;
-
-  try {
-    await new Promise((resolve, reject) => {
-      listener = snapshot => resolve(snapshot);
-      ref.on("value", listener, reject);
-    });
-
-    return await ref.transaction(
-      updater,
-      undefined,
-      false
-    );
-  } finally {
-    if (listener) ref.off("value", listener);
-  }
+  return ref.transaction(updater, undefined, false);
 }
 
 async function verifyToken(token) {
@@ -129,7 +116,7 @@ async function verifyToken(token) {
   }
 
   try {
-    return await admin.auth().verifyIdToken(token, true);
+    return await admin.auth().verifyIdToken(token, false);
   } catch {
     throw new Error("INVALID_TOKEN");
   }
@@ -221,7 +208,7 @@ function createGame(now) {
     roundNumber: 1,
     roundStartsAt: now,
     roundEndsAt: now + ROUND_MS,
-    cycleEndsAt: now + ROUND_MS + RESULT_MS,
+    cycleEndsAt: now + ROUND_MS + FINALIZE_MS + RESULT_MS,
     activeBets: {},
     pendingSettlement: {},
     history: []
@@ -233,16 +220,22 @@ function cycleEndsAt(value) {
     (Number(value?.roundEndsAt || 0) + RESULT_MS));
 }
 
-function phaseOf(value) {
+function phaseOf(value, now = Date.now()) {
   if (!validGame(value)) return "waiting";
-  return Date.now() < Number(value.roundEndsAt)
-    ? "betting" : "result";
+  const end = Number(value.roundEndsAt);
+  if (now < end) return "betting";
+  if (now < end + FINALIZE_MS) return "locking";
+  return "result";
 }
 
 function remaining() {
   if (!game) return null;
-  const end = phaseOf(game) === "betting"
-    ? Number(game.roundEndsAt) : cycleEndsAt(game);
+  const phase = phaseOf(game);
+  const end = phase === "betting"
+    ? Number(game.roundEndsAt)
+    : phase === "locking"
+      ? Number(game.roundEndsAt) + FINALIZE_MS
+      : cycleEndsAt(game);
   return Math.max(0, Math.ceil((end - Date.now()) / 1000));
 }
 
@@ -252,6 +245,7 @@ function publicState() {
     roundStartsAt: game?.roundStartsAt ?? null,
     roundEndsAt: game?.roundEndsAt ?? null,
     cycleEndsAt: game ? cycleEndsAt(game) : null,
+    finalizationMs: FINALIZE_MS,
     serverTime: Date.now(),
     secondsRemaining: remaining(),
     bettingEnabled:
@@ -279,6 +273,7 @@ function sendClock() {
     roundStartsAt: game.roundStartsAt,
     roundEndsAt: game.roundEndsAt,
     cycleEndsAt: cycleEndsAt(game),
+    finalizationMs: FINALIZE_MS,
     serverTime: Date.now(),
     secondsRemaining: remaining(),
     phase: phaseOf(game),
@@ -541,7 +536,7 @@ async function closeRound() {
     const winner = crypto.randomInt(8);
     const tx = await transactionReady(gameRef(), current => {
       if (!validGame(current)) return;
-      if (Date.now() < Number(current.roundEndsAt)) return;
+      if (Date.now() < Number(current.roundEndsAt) + FINALIZE_MS) return;
       const roundNumber = Number(current.roundNumber);
       const history = historyArray(current.history);
       if (history.some(x => Number(x.roundNumber) === roundNumber)) return;
@@ -600,7 +595,7 @@ async function advanceGame() {
         roundNumber: roundNumber + 1,
         roundStartsAt: now,
         roundEndsAt: now + ROUND_MS,
-        cycleEndsAt: now + ROUND_MS + RESULT_MS,
+        cycleEndsAt: now + ROUND_MS + FINALIZE_MS + RESULT_MS,
         activeBets: {}
       };
     });
@@ -625,13 +620,6 @@ async function reserveCoins(
   amount,
   roundNumber
 ) {
-  const wallet = await readWallet(
-    uid,
-    "BET_RESERVE"
-  );
-
-  if (!wallet.ok) return wallet;
-
   let reason = "WALLET_REJECTED";
 
   const tx = await transactionReady(
@@ -759,7 +747,7 @@ async function refundBet(uid, betId) {
   );
 }
 
-async function placeBet(data) {
+async function placeBet(data, receivedAt = Date.now()) {
   if (!BETTING_ENABLED) {
     return errorResult("BETTING_DISABLED");
   }
@@ -797,22 +785,11 @@ async function placeBet(data) {
   const uid = decoded.uid;
   const betKey = `${uid}_${betId}`;
 
-  const wallet = await readWallet(
-    uid,
-    "BET_REQUEST"
-  );
-
-  if (!wallet.ok) return wallet;
-
-  const currentGame = (
-    await gameRef().once("value")
-  ).val();
-
-  if (
-    !validGame(currentGame) ||
-    currentGame.roundNumber !== roundNumber ||
-    phaseOf(currentGame) !== "betting"
-  ) {
+  // The timestamp comes from the Socket.IO server, NOT the Android phone.
+  // Only a tap received during the 25s betting period is eligible. Its
+  // Firebase transaction may finish within FINALIZE_MS after the countdown.
+  if (receivedAt >= Number(game.roundEndsAt) ||
+      Number(game.roundNumber) !== roundNumber) {
     return errorResult("ROUND_CLOSED");
   }
 
@@ -833,7 +810,30 @@ async function placeBet(data) {
     return errorResult("WALLET_ERROR");
   }
 
-  if (!reserved.ok) return reserved;
+  if (!reserved.ok) {
+    if (reserved.error === "DUPLICATE_BET") {
+      const record = (await userRef(uid)
+        .child("lionBets").child(betId).once("value")).val();
+      const same = Number(record?.amount) === amount &&
+        Number(record?.roundNumber) === roundNumber;
+      if (same && record.status !== "refunded") {
+        const current = (await gameRef().once("value")).val();
+        const present = Boolean(current?.activeBets?.[betKey]) ||
+          Object.values(current?.pendingSettlement || {}).some(
+            entry => Boolean(entry?.bets?.[betKey])
+          );
+        if (present) {
+          return {
+            ok: true, betId, foodIndex, amount, roundNumber,
+            balance: Number((await userRef(uid)
+              .child("coins").once("value")).val())
+          };
+        }
+        return errorResult("BET_PROCESSING");
+      }
+    }
+    return reserved;
+  }
 
   let reason = "BET_REJECTED";
 
@@ -848,7 +848,11 @@ async function placeBet(data) {
 
         if (
           current.roundNumber !== roundNumber ||
-          phaseOf(current) !== "betting"
+          receivedAt >= Number(current.roundEndsAt) ||
+          Date.now() >= Number(current.roundEndsAt) + FINALIZE_MS ||
+          historyArray(current.history).some(
+            item => Number(item.roundNumber) === roundNumber
+          )
         ) {
           reason = "ROUND_CLOSED";
           return;
@@ -905,14 +909,11 @@ async function placeBet(data) {
 
     game = tx.snapshot.val();
 
-    try {
-      await setBetStatus(uid, betId, "accepted");
-    } catch (error) {
-      console.error(
-        "BET STATUS ERROR:",
-        error.message
-      );
-    }
+    // Ack the bet as soon as its durable wallet reservation and round entry
+    // exist. Status bookkeeping must not delay the UI acknowledgement.
+    setBetStatus(uid, betId, "accepted").catch(error => {
+      console.error("BET STATUS ERROR:", error.message);
+    });
 
     return {
       ok: true,
@@ -977,13 +978,6 @@ async function creditWinner(
   amount
 ) {
   const key = String(roundNumber);
-
-  const wallet = await readWallet(
-    uid,
-    "LION_PAYOUT"
-  );
-
-  if (!wallet.ok) return false;
 
   const tx = await transactionReady(
     userRef(uid),
@@ -1555,13 +1549,14 @@ io.on("connection", socket => {
   socket.on(
     "greedy_lion_place_bet",
     async (data, ack) => {
+      const receivedAt = Date.now();
       const reply =
         typeof ack === "function"
           ? ack
           : () => {};
 
       try {
-        const result = await placeBet(data);
+        const result = await placeBet(data, receivedAt);
         reply(result);
       } catch (error) {
         console.error(
@@ -1606,7 +1601,7 @@ setInterval(() => {
       advanceGame().catch(console.error);
     }
   }
-}, 1000);
+}, 250);
 
 // Faster fallback for settlement failures.
 setInterval(() => {
@@ -1635,6 +1630,9 @@ app.get("/", (req, res) => {
       game?.roundStartsAt ?? null,
     roundEndsAt:
       game?.roundEndsAt ?? null,
+    cycleEndsAt: game ? cycleEndsAt(game) : null,
+    phase: phaseOf(game),
+    finalizationMs: FINALIZE_MS,
     durationMs: game
       ? Number(game.roundEndsAt) -
         Number(game.roundStartsAt)
