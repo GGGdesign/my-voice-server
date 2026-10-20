@@ -1,4 +1,3 @@
-
 "use strict";
 
 const express = require("express");
@@ -100,37 +99,36 @@ function errorResult(error) {
   return { ok: false, error };
 }
 
-// Initialize Firebase listener before transactions.
+// A transaction already performs the required server-side read.  Installing
+// an additional value listener on the whole user/game node before EVERY bet
+// creates a redundant large Firebase download and slows acknowledgment.
 async function transactionReady(ref, updater) {
-  let listener = null;
-
-  try {
-    await new Promise((resolve, reject) => {
-      listener = snapshot => resolve(snapshot);
-      ref.on("value", listener, reject);
-    });
-
-    return await ref.transaction(
-      updater,
-      undefined,
-      false
-    );
-  } finally {
-    if (listener) ref.off("value", listener);
-  }
+  return ref.transaction(updater, undefined, false);
 }
 
+// Cache only already-verified ID tokens for a short period.  A fresh token
+// still gets Firebase revocation verification; cache expires before token exp.
+const verifiedTokens = new Map();
+const VERIFY_CACHE_MS = 25000;
 async function verifyToken(token) {
-  if (!firebaseReady) {
-    throw new Error("SERVER_NOT_READY");
-  }
-
-  if (!token || typeof token !== "string") {
-    throw new Error("TOKEN_REQUIRED");
-  }
-
+  if (!firebaseReady) throw new Error("SERVER_NOT_READY");
+  if (!token || typeof token !== "string") throw new Error("TOKEN_REQUIRED");
+  const key = crypto.createHash("sha256").update(token).digest("hex");
+  const cached = verifiedTokens.get(key);
+  if (cached && cached.expires > Date.now()) return cached.decoded;
+  if (cached) verifiedTokens.delete(key);
   try {
-    return await admin.auth().verifyIdToken(token, true);
+    const decoded = await admin.auth().verifyIdToken(token, true);
+    const expiry = Math.min(Date.now() + VERIFY_CACHE_MS,
+      Number(decoded.exp || 0) * 1000 - 2000);
+    if (expiry > Date.now()) verifiedTokens.set(key, { decoded, expires: expiry });
+    if (verifiedTokens.size > 2000) {
+      const now = Date.now();
+      for (const [k, entry] of verifiedTokens) {
+        if (entry.expires <= now || verifiedTokens.size > 1500) verifiedTokens.delete(k);
+      }
+    }
+    return decoded;
   } catch {
     throw new Error("INVALID_TOKEN");
   }
@@ -190,7 +188,9 @@ let settlementProcessing = false;
 // The client can display them optimistically; ONLY a server transaction
 // changes coins, as required by the database security rules.
 const incomingBets = new Map();
-const MAX_SETTLE_WAIT_MS = 20000;
+// Keep a small grace period for requests that reached the server before the
+// cutoff; never stall the spin for 20 seconds when a Firebase request hangs.
+const MAX_SETTLE_WAIT_MS = 4000;
 
 function beginIncoming(round) {
   incomingBets.set(round, (incomingBets.get(round) || 0) + 1);
@@ -213,6 +213,8 @@ function admissionFor(data) {
       !Number.isSafeInteger(round)) return errorResult("INVALID_BET");
   if (game.roundNumber !== round || now >= Number(game.roundEndsAt))
     return errorResult("ROUND_CLOSED");
+  // A player may repeat bets on chosen slots, but can choose no more than six.
+  // The authenticated UID is checked within the authoritative transaction.
   return { ok: true, round, receivedAt: now };
 }
 
@@ -441,11 +443,9 @@ async function buildWinnerDetails(entry) {
   return winners;
 }
 
-async function publishRoundWinners(entry) {
+async function publishRoundWinners(entry, preparedWinners = null) {
   const roundNumber = Number(entry.roundNumber);
-  const key = String(roundNumber);
-
-  const winners = await buildWinnerDetails(entry);
+  const winners = preparedWinners || await buildWinnerDetails(entry);
 
   const patch = {
     winners,
@@ -836,11 +836,17 @@ async function placeBet(data, admission) {
 
   // Admission was recorded on socket receipt, BEFORE slow token / wallet IO.
   // A valid pre-deadline request may finish just after the clock hits zero.
-  const currentGame = (await gameRef().once("value")).val();
+  const currentGame = game;
   if (!validGame(currentGame) || currentGame.roundNumber !== roundNumber ||
       historyArray(currentGame.history).some(
         entry => Number(entry.roundNumber) === roundNumber
       )) return errorResult("ROUND_CLOSED");
+  // Fast rejection avoids a wallet debit/refund for an already-full board.
+  const chosen = new Set(Object.values(currentGame.activeBets || {})
+    .filter(b => b.uid === uid)
+    .map(b => Number(b.foodIndex)));
+  if (!chosen.has(foodIndex) && chosen.size >= 6)
+    return errorResult("MAX_SIX_SLOTS");
 
   let reserved;
 
@@ -891,8 +897,15 @@ async function placeBet(data, admission) {
           return;
         }
 
-        // The player can bet on any of the eight slots, repeatedly.
-        // The wallet transaction is the only monetary limit.
+        // Enforce six DISTINCT food slots atomically for concurrent bets.
+        const occupied = new Set();
+        for (const bet of Object.values(activeBets)) {
+          if (bet.uid === uid) occupied.add(Number(bet.foodIndex));
+        }
+        if (!occupied.has(foodIndex) && occupied.size >= 6) {
+          reason = "MAX_SIX_SLOTS";
+          return;
+        }
         activeBets[betKey] = {
           uid,
           betId,
@@ -919,14 +932,11 @@ async function placeBet(data, admission) {
 
     game = tx.snapshot.val();
 
-    try {
-      await setBetStatus(uid, betId, "accepted");
-    } catch (error) {
-      console.error(
-        "BET STATUS ERROR:",
-        error.message
-      );
-    }
+    // The wager and wallet debit are now durable. Return the ACK immediately;
+    // a third Firebase transaction merely annotates the accepted bet ledger.
+    setBetStatus(uid, betId, "accepted").catch(error => {
+      console.error("BET STATUS ERROR:", error.message);
+    });
 
     return {
       ok: true,
@@ -1055,21 +1065,28 @@ async function settlePending() {
         entry.payoutVersion !== 2
       ) continue;
 
+      let preparedWinners = null;
+      let fullySettled = entry.settled === true;
       if (!entry.settled) {
         const totals = calculatePayouts(entry);
-        let allPaid = true;
-        for (const [uid, amount] of Object.entries(totals)) {
-          try {
-            const paid = await creditWinner(uid, entry.roundNumber, amount);
-            if (!paid) allPaid = false;
-          } catch (error) {
-            allPaid = false;
-            console.error("PAYOUT ERROR:", error.message);
+        // Profile loading and each player's independent wallet credit run
+        // concurrently. Each credit is still idempotent per uid/round.
+        const profilesPromise = buildWinnerDetails(entry);
+        const payments = await Promise.all(Object.entries(totals).map(
+          async ([uid, amount]) => {
+            try {
+              return await creditWinner(uid, entry.roundNumber, amount);
+            } catch (error) {
+              console.error("PAYOUT ERROR:", uid, error.message);
+              return false;
+            }
           }
-        }
-        if (!allPaid) continue;
+        ));
+        if (payments.some(ok => !ok)) continue;
         await gameRef().child("pendingSettlement")
           .child(key).update({ settled: true, settledAt: Date.now() });
+        fullySettled = true;
+        preparedWinners = await profilesPromise;
       }
 
       const hist = historyArray((await gameRef().child("history").once("value")).val());
@@ -1079,10 +1096,27 @@ async function settlePending() {
       );
       if (!published) {
         try {
-          await publishRoundWinners(entry);
+          await publishRoundWinners(entry, preparedWinners);
         } catch (error) {
           console.error("WINNER DISPLAY ERROR:", error.message);
         }
+      }
+
+      // Do not keep every past round's bet list inside greedyLionGame forever.
+      // The old implementation accumulated all settled rounds, making EACH
+      // new bet's game-root transaction progressively slower. The user payout
+      // ledger and published history are already durable by this point.
+      const latestHistory = historyArray(
+        (await gameRef().child("history").once("value")).val()
+      );
+      const safelyPublished = latestHistory.some(item =>
+        Number(item.roundNumber) === Number(entry.roundNumber) &&
+        item.hasSettledBets === true
+      );
+      const beyondHistory = Number(entry.roundNumber) <
+        Number(game?.roundNumber || 0) - 8;
+      if (fullySettled && (safelyPublished || beyondHistory)) {
+        await gameRef().child("pendingSettlement").child(key).remove();
       }
 
       console.log("ROUND SETTLED:", key);
@@ -1145,13 +1179,8 @@ async function giftReceiverOnSeat(
 }
 
 async function chargeGift(uid, request) {
-  const wallet = await readWallet(
-    uid,
-    "GIFT_SEND"
-  );
-
-  if (!wallet.ok) return wallet;
-
+  // /api/gifts/send already checked the sender and possible retry. The
+  // transaction itself checks the actual balance against concurrent charges.
   let reason = "PAYMENT_REJECTED";
 
   const tx = await transactionReady(
@@ -1242,14 +1271,12 @@ async function publishGift(uid, request, payment) {
     .child("giftEvents")
     .child(eventId);
 
-  await transactionReady(ref, current => {
+  const eventTx = await transactionReady(ref, current => {
     if (current !== null) return;
     return event;
   });
 
-  const saved = (
-    await ref.once("value")
-  ).val();
+  const saved = eventTx.snapshot.val();
 
   if (
     !saved ||
