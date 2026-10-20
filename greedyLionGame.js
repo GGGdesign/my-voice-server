@@ -1,6 +1,9 @@
 
 "use strict";
 
+// Max Chat Greedy Lion
+// Used by server.js through attachGreedyLion.
+
 function attachGreedyLion({
   app,
   io,
@@ -9,233 +12,169 @@ function attachGreedyLion({
 }) {
   const crypto = require("crypto");
 
-  const GAME_PATH = "greedyLionGame";
   const ROOM = "maxchat_greedy_lion_global";
+  const PATH = "greedyLionGame";
 
   const BET_MS = 25000;
   const RESULT_MS = 6000;
+
+  const MIN_BET = 100;
+  const MAX_BET = 100000000;
 
   const MULTIPLIERS = [
     45, 5, 5, 10, 15, 5, 5, 25
   ];
 
-  const CHIPS = [
-    100, 500, 1000, 5000, 10000
-  ];
-
-  const BETS_ENABLED =
+  const enabled =
     process.env.LION_ENABLE_BETS !== "false";
 
-  let ready = Boolean(firebaseReady);
+  const ready = Boolean(firebaseReady);
+
+  const db = () => admin.database();
+
+  const gameRef = () => db().ref(PATH);
+
+  const userRef = uid =>
+    db().ref("Users").child(uid);
+
+  const validCoins = n =>
+    Number.isSafeInteger(n) && n >= 0;
+
+  const validId = s =>
+    typeof s === "string" &&
+    /^[a-zA-Z0-9_-]{1,100}$/.test(s);
+
+  const fail = error => ({
+    ok: false,
+    error
+  });
+
   let game = null;
-  let gameStarting = false;
-  let advancing = false;
+  let starting = false;
+  let switching = false;
   let settling = false;
+  let lastStateSignature = "";
 
-  function db() {
-    if (!ready) {
-      throw Error("FIREBASE_NOT_READY");
-    }
-
-    return admin.database();
+  async function transaction(ref, callback) {
+    // Atomic Firebase transaction.
+    // No network calls inside updater.
+    return ref.transaction(
+      callback,
+      undefined,
+      false
+    );
   }
-
-  function gameRef() {
-    return db().ref(GAME_PATH);
-  }
-
-  function userRef(uid) {
-    return db()
-      .ref("Users")
-      .child(uid);
-  }
-
-  function validId(value) {
-    return typeof value === "string" &&
-      /^[a-zA-Z0-9_-]{1,100}$/.test(value);
-  }
-
-  function validCoins(value) {
-    return Number.isSafeInteger(value) &&
-      value >= 0;
-  }
-
-  function fail(error) {
-    return {
-      ok: false,
-      error
-    };
-  }
-
-  async function transaction(ref, update) {
-    let listener;
-
-    try {
-      await new Promise((resolve, reject) => {
-        listener = resolve;
-
-        ref.on(
-          "value",
-          listener,
-          reject
-        );
-      });
-
-      return await ref.transaction(
-        update,
-        undefined,
-        false
-      );
-    } finally {
-      if (listener) {
-        ref.off("value", listener);
-      }
-    }
-  }
-
-  async function verifyToken(token) {
-    if (!ready) {
-      throw Error("SERVER_NOT_READY");
-    }
-
-    if (!token) {
-      throw Error("TOKEN_REQUIRED");
-    }
-
-    try {
-      return await admin.auth().verifyIdToken(
-        String(token),
-        true
-      );
-    } catch {
-      throw Error("INVALID_TOKEN");
-    }
-  }
-
-  // =====================================
-  // GAME STATE
-  // =====================================
 
   function historyArray(value) {
-    if (Array.isArray(value)) {
-      return value
-        .filter(Boolean)
-        .slice(-8);
-    }
+    const array = Array.isArray(value)
+      ? value
+      : Object.values(value || {});
 
-    if (value && typeof value === "object") {
-      return Object.values(value)
-        .filter(Boolean)
-        .sort(
-          (a, b) =>
-            Number(a.roundNumber) -
-            Number(b.roundNumber)
-        )
-        .slice(-8);
-    }
-
-    return [];
-  }
-
-  function validGame(value) {
-    return Boolean(
-      value &&
-      Number.isSafeInteger(value.roundNumber) &&
-      value.roundNumber > 0 &&
-      Number.isFinite(
-        Number(value.roundEndsAt)
+    return array
+      .filter(Boolean)
+      .sort(
+        (a, b) =>
+          Number(a.roundNumber) -
+          Number(b.roundNumber)
       )
-    );
+      .slice(-12);
   }
 
-  function cycleEnd(value) {
-    return Number(
-      value.cycleEndsAt ||
-      Number(value.roundEndsAt) + RESULT_MS
-    );
+  function validGame(g) {
+    return !!g &&
+      Number.isSafeInteger(g.roundNumber) &&
+      g.roundNumber > 0 &&
+      Number.isFinite(Number(g.roundEndsAt)) &&
+      Number.isFinite(Number(g.roundStartsAt));
   }
 
-  function phase(value) {
-    if (!validGame(value)) {
+  const cycleEnd = g =>
+    Number(
+      g.cycleEndsAt ||
+      (Number(g.roundEndsAt) + RESULT_MS)
+    );
+
+  function phase(g) {
+    if (!validGame(g)) {
       return "waiting";
     }
 
-    return Date.now() <
-      Number(value.roundEndsAt)
+    return Date.now() < Number(g.roundEndsAt)
       ? "betting"
       : "result";
   }
 
-  function createGame(now) {
+  function makeGame(now) {
     return {
       roundNumber: 1,
       roundStartsAt: now,
       roundEndsAt: now + BET_MS,
-      cycleEndsAt:
-        now + BET_MS + RESULT_MS,
+      cycleEndsAt: now + BET_MS + RESULT_MS,
       activeBets: {},
       pendingSettlement: {},
       history: []
     };
   }
 
-  function remaining() {
-    if (!game) {
-      return 0;
-    }
-
-    const end =
-      phase(game) === "betting"
-        ? Number(game.roundEndsAt)
-        : cycleEnd(game);
-
-    return Math.max(
-      0,
-      Math.ceil(
-        (end - Date.now()) / 1000
-      )
-    );
-  }
-
   function state() {
+    const p = phase(game);
+
+    const end = p === "betting"
+      ? game?.roundEndsAt
+      : (game ? cycleEnd(game) : 0);
+
     return {
-      roundNumber:
-        game?.roundNumber || null,
-      roundStartsAt:
-        game?.roundStartsAt || null,
-      roundEndsAt:
-        game?.roundEndsAt || null,
-      cycleEndsAt:
-        game ? cycleEnd(game) : null,
+      roundNumber: game?.roundNumber || null,
+      roundStartsAt: game?.roundStartsAt || null,
+      roundEndsAt: game?.roundEndsAt || null,
+      cycleEndsAt: game
+        ? cycleEnd(game)
+        : null,
       serverTime: Date.now(),
-      secondsRemaining: remaining(),
+      secondsRemaining: Math.max(
+        0,
+        Math.ceil(
+          (Number(end) - Date.now()) / 1000
+        )
+      ),
       bettingEnabled:
-        ready &&
-        BETS_ENABLED &&
-        phase(game) === "betting",
-      phase: phase(game),
+        ready && enabled && p === "betting",
+      phase: p,
+      minBet: MIN_BET,
+      maxBet: MAX_BET,
       multipliers: MULTIPLIERS,
-      history: historyArray(
-        game?.history
-      )
+      history: historyArray(game?.history)
     };
   }
 
-  function sendState() {
-    if (!game) {
+  function sendState(force = false) {
+    if (!game) return;
+
+    const s = state();
+
+    const signature = JSON.stringify({
+      round: s.roundNumber,
+      phase: s.phase,
+      history: s.history
+    });
+
+    if (
+      !force &&
+      signature === lastStateSignature
+    ) {
       return;
     }
 
+    lastStateSignature = signature;
+
     io.to(ROOM).emit(
       "greedy_lion_state",
-      state()
+      s
     );
   }
 
   function sendClock() {
-    if (!game) {
-      return;
-    }
+    if (!game) return;
 
     const s = state();
 
@@ -247,65 +186,78 @@ function attachGreedyLion({
         roundEndsAt: s.roundEndsAt,
         cycleEndsAt: s.cycleEndsAt,
         serverTime: s.serverTime,
-        secondsRemaining:
-          s.secondsRemaining,
-        bettingEnabled:
-          s.bettingEnabled,
-        phase: s.phase
+        secondsRemaining: s.secondsRemaining,
+        phase: s.phase,
+        bettingEnabled: s.bettingEnabled
       }
     );
   }
 
   async function startGame() {
-    if (!ready || gameStarting) {
-      return;
-    }
+    if (!ready || starting) return;
 
-    gameStarting = true;
+    starting = true;
 
     try {
       const ref = gameRef();
 
-      const snap =
-        await ref.once("value");
+      await transaction(
+        ref,
+        current =>
+          current === null
+            ? makeGame(Date.now())
+            : undefined
+      );
 
-      if (!snap.exists()) {
-        await transaction(ref, current => {
-          if (current !== null) {
+      ref.on(
+        "value",
+        snap => {
+          const current = snap.val();
+
+          if (!validGame(current)) {
             return;
           }
 
-          return createGame(Date.now());
-        });
-      }
-
-      ref.on("value", snapshot => {
-        const saved = snapshot.val();
-
-        if (!validGame(saved)) {
-          return;
+          game = current;
+          sendState();
+        },
+        error => {
+          console.error(
+            "LION GAME LISTENER:",
+            error.message
+          );
         }
-
-        game = saved;
-        sendState();
-      });
-
-      console.log(
-        "LION GAME STARTED"
       );
-    } catch (e) {
-      gameStarting = false;
 
+      console.log("GREEDY LION READY");
+    } catch (error) {
+      starting = false;
       console.error(
-        "START ERROR:",
-        e.message
+        "LION START ERROR:",
+        error.message
       );
     }
   }
 
-  // =====================================
-  // WINNER PROFILES
-  // =====================================
+  async function verifyToken(token) {
+    if (!ready) {
+      throw Error("SERVER_NOT_READY");
+    }
+
+    if (
+      !token ||
+      typeof token !== "string"
+    ) {
+      throw Error("TOKEN_REQUIRED");
+    }
+
+    try {
+      return await admin.auth()
+        .verifyIdToken(token, true);
+    } catch {
+      throw Error("INVALID_TOKEN");
+    }
+  }
 
   function profileName(user) {
     return String(
@@ -330,64 +282,78 @@ function attachGreedyLion({
     );
   }
 
-  function payouts(entry) {
-    const totals = {};
+  // =====================================
+  // EXACT WINNINGS
+  // =====================================
 
-    const index = Number(
+  function payouts(entry) {
+    const result = {};
+
+    const winningIndex = Number(
       entry.winningIndex
     );
+
+    if (
+      !(
+        winningIndex >= 0 &&
+        winningIndex < 8
+      )
+    ) {
+      return result;
+    }
 
     for (
       const bet of Object.values(
         entry.bets || {}
       )
     ) {
-      const uid = String(
-        bet.uid || ""
-      );
-
-      const amount = Number(
-        bet.amount
-      );
-
-      const slot = Number(
-        bet.foodIndex
-      );
+      const uid = bet?.uid;
+      const amount = Number(bet?.amount);
 
       if (
         !validId(uid) ||
-        slot !== index ||
+        Number(bet.foodIndex) !== winningIndex ||
         !validCoins(amount) ||
         amount === 0
       ) {
         continue;
       }
 
-      const value =
-        amount * MULTIPLIERS[index];
+      const payout =
+        amount * MULTIPLIERS[winningIndex];
 
-      const total =
-        (totals[uid] || 0) + value;
+      const next =
+        (result[uid] || 0) + payout;
 
-      if (validCoins(total)) {
-        totals[uid] = total;
+      if (
+        !validCoins(payout) ||
+        !validCoins(next)
+      ) {
+        throw Error(
+          "PAYOUT_OVERFLOW:" + uid
+        );
       }
+
+      result[uid] = next;
     }
 
-    return totals;
+    return result;
   }
 
+  // =====================================
+  // REAL WINNER PROFILES
+  // =====================================
+
   async function winnerDetails(entry) {
-    const ordered =
-      Object.entries(
-        payouts(entry)
-      ).sort(
-        (a, b) => b[1] - a[1]
-      );
+    const all = Object.entries(
+      payouts(entry)
+    ).sort(
+      (a, b) => b[1] - a[1]
+    );
 
     return Promise.all(
-      ordered.map(
-        async ([uid, amount], i) => {
+      all.map(
+        async ([uid, amount], idx) => {
           let user = {};
 
           try {
@@ -395,11 +361,11 @@ function attachGreedyLion({
               await userRef(uid)
                 .once("value")
             ).val() || {};
-          } catch (e) {
+          } catch (error) {
             console.error(
-              "PROFILE ERROR:",
+              "WINNER PROFILE:",
               uid,
-              e.message
+              error.message
             );
           }
 
@@ -410,7 +376,7 @@ function attachGreedyLion({
             profilePhoto(user);
 
           return {
-            rank: i + 1,
+            rank: idx + 1,
             uid,
             userUid: uid,
             userId: String(
@@ -463,20 +429,29 @@ function attachGreedyLion({
           return;
         }
 
-        const history =
-          historyArray(
-            current.history
-          );
+        const history = historyArray(
+          current.history
+        );
 
-        const i =
-          history.findIndex(
-            x =>
-              Number(
-                x.roundNumber
-              ) === roundNumber
-          );
+        const i = history.findIndex(
+          x =>
+            Number(x.roundNumber) ===
+            roundNumber
+        );
 
         if (i < 0) {
+          return;
+        }
+
+        if (
+          history[i].hasSettledBets &&
+          Array.isArray(
+            history[i].winners
+          ) &&
+          JSON.stringify(
+            history[i].winners
+          ) === JSON.stringify(winners)
+        ) {
           return;
         }
 
@@ -515,29 +490,31 @@ function attachGreedyLion({
       "greedy_lion_round_result",
       result
     );
+
+    return result;
   }
 
   // =====================================
-  // ROUND RESULT
+  // END OF BETTING
   // =====================================
 
   async function announceResult() {
     if (
       !ready ||
       !game ||
-      advancing
+      switching
     ) {
       return;
     }
 
-    advancing = true;
+    switching = true;
 
     try {
-      const round = Number(
+      const roundNumber = Number(
         game.roundNumber
       );
 
-      const winner =
+      const winningIndex =
         crypto.randomInt(8);
 
       const now = Date.now();
@@ -545,14 +522,11 @@ function attachGreedyLion({
       const tx = await transaction(
         gameRef(),
         current => {
-          if (!validGame(current)) {
-            return;
-          }
-
           if (
+            !validGame(current) ||
             Number(
               current.roundNumber
-            ) !== round ||
+            ) !== roundNumber ||
             Date.now() <
               Number(
                 current.roundEndsAt
@@ -561,17 +535,15 @@ function attachGreedyLion({
             return;
           }
 
-          const history =
-            historyArray(
-              current.history
-            );
+          const history = historyArray(
+            current.history
+          );
 
           if (
             history.some(
               x =>
-                Number(
-                  x.roundNumber
-                ) === round
+                Number(x.roundNumber) ===
+                roundNumber
             )
           ) {
             return;
@@ -580,43 +552,44 @@ function attachGreedyLion({
           const bets =
             current.activeBets || {};
 
-          const pending = {
-            ...(current.pendingSettlement || {})
+          const pendingSettlement = {
+            ...(
+              current.pendingSettlement || {}
+            )
           };
 
           if (
             Object.keys(bets).length
           ) {
-            pending[
-              String(round)
+            pendingSettlement[
+              String(roundNumber)
             ] = {
-              roundNumber: round,
-              winningIndex: winner,
+              roundNumber,
+              winningIndex,
               completedAt: now,
-              payoutVersion: 2,
+              payoutVersion: 3,
               settled: false,
               bets
             };
           }
 
           const result = {
-            roundNumber: round,
-            winningIndex: winner,
+            roundNumber,
+            winningIndex,
             completedAt: now,
             hasSettledBets:
-              Object.keys(bets)
-                .length === 0,
+              !Object.keys(bets).length,
             winners: [],
             topWinners: []
           };
 
           return {
             ...current,
-            pendingSettlement: pending,
+            pendingSettlement,
             history: [
               ...history,
               result
-            ].slice(-8)
+            ].slice(-12)
           };
         }
       );
@@ -627,15 +600,13 @@ function attachGreedyLion({
 
       game = tx.snapshot.val();
 
-      const result =
-        historyArray(
-          game.history
-        ).find(
-          x =>
-            Number(
-              x.roundNumber
-            ) === round
-        );
+      const result = historyArray(
+        game.history
+      ).find(
+        x =>
+          Number(x.roundNumber) ===
+          roundNumber
+      );
 
       if (result) {
         io.to(ROOM).emit(
@@ -644,18 +615,23 @@ function attachGreedyLion({
         );
       }
 
-      sendState();
+      sendState(true);
 
       settlePending().catch(
-        console.error
+        error => {
+          console.error(
+            "SETTLE AFTER RESULT:",
+            error.message
+          );
+        }
       );
-    } catch (e) {
+    } catch (error) {
       console.error(
-        "RESULT ERROR:",
-        e.message
+        "LION RESULT ERROR:",
+        error.message
       );
     } finally {
-      advancing = false;
+      switching = false;
     }
   }
 
@@ -667,12 +643,12 @@ function attachGreedyLion({
     if (
       !ready ||
       !game ||
-      advancing
+      switching
     ) {
       return;
     }
 
-    advancing = true;
+    switching = true;
 
     try {
       const now = Date.now();
@@ -680,30 +656,24 @@ function attachGreedyLion({
       const tx = await transaction(
         gameRef(),
         current => {
-          if (!validGame(current)) {
-            return;
-          }
-
           if (
-            Date.now() <
-            cycleEnd(current)
+            !validGame(current) ||
+            Date.now() < cycleEnd(current)
           ) {
             return;
           }
 
-          const round = Number(
+          const roundNumber = Number(
             current.roundNumber
           );
 
-          const recorded =
-            historyArray(
-              current.history
-            ).some(
-              x =>
-                Number(
-                  x.roundNumber
-                ) === round
-            );
+          const recorded = historyArray(
+            current.history
+          ).some(
+            x =>
+              Number(x.roundNumber) ===
+              roundNumber
+          );
 
           if (!recorded) {
             return;
@@ -712,44 +682,45 @@ function attachGreedyLion({
           return {
             ...current,
             roundNumber:
-              round + 1,
+              roundNumber + 1,
             roundStartsAt: now,
             roundEndsAt:
               now + BET_MS,
             cycleEndsAt:
-              now +
-              BET_MS +
-              RESULT_MS,
+              now + BET_MS + RESULT_MS,
             activeBets: {}
           };
         }
       );
 
-      if (tx.committed) {
-        game = tx.snapshot.val();
-
-        sendState();
-        sendClock();
+      if (!tx.committed) {
+        return;
       }
-    } catch (e) {
+
+      game = tx.snapshot.val();
+
+      sendState(true);
+      sendClock();
+    } catch (error) {
       console.error(
         "NEXT ROUND ERROR:",
-        e.message
+        error.message
       );
     } finally {
-      advancing = false;
+      switching = false;
     }
   }
 
   // =====================================
-  // BET WALLET
+  // RESERVE REAL COINS
   // =====================================
 
   async function reserveBet(
     uid,
     betId,
     amount,
-    round
+    roundNumber,
+    foodIndex
   ) {
     let reason =
       "BET_REJECTED";
@@ -762,10 +733,10 @@ function attachGreedyLion({
           return;
         }
 
-        const bets =
+        const old =
           user.lionBets || {};
 
-        if (bets[betId]) {
+        if (old[betId]) {
           reason = "DUPLICATE_BET";
           return;
         }
@@ -779,8 +750,7 @@ function attachGreedyLion({
         }
 
         if (coins < amount) {
-          reason =
-            "INSUFFICIENT_COINS";
+          reason = "INSUFFICIENT_COINS";
           return;
         }
 
@@ -788,10 +758,11 @@ function attachGreedyLion({
           ...user,
           coins: coins - amount,
           lionBets: {
-            ...bets,
+            ...old,
             [betId]: {
               amount,
-              roundNumber: round,
+              foodIndex,
+              roundNumber,
               status: "reserved",
               createdAt: Date.now()
             }
@@ -812,19 +783,16 @@ function attachGreedyLion({
     };
   }
 
-  async function updateBetStatus(
+  async function setBetStatus(
     uid,
     betId
   ) {
     await transaction(
       userRef(uid),
       user => {
-        const bet =
-          user?.lionBets?.[betId];
-
         if (
-          !bet ||
-          bet.status !== "reserved"
+          user?.lionBets?.[betId]
+            ?.status !== "reserved"
         ) {
           return;
         }
@@ -834,7 +802,7 @@ function attachGreedyLion({
           lionBets: {
             ...user.lionBets,
             [betId]: {
-              ...bet,
+              ...user.lionBets[betId],
               status: "accepted"
             }
           }
@@ -869,17 +837,14 @@ function attachGreedyLion({
         if (
           !validCoins(coins) ||
           !validCoins(amount) ||
-          !validCoins(
-            coins + amount
-          )
+          !validCoins(coins + amount)
         ) {
           return;
         }
 
         return {
           ...user,
-          coins:
-            coins + amount,
+          coins: coins + amount,
           lionBets: {
             ...user.lionBets,
             [betId]: {
@@ -900,21 +865,32 @@ function attachGreedyLion({
     );
   }
 
+  async function betRecorded(key) {
+    const saved = (
+      await gameRef().once("value")
+    ).val();
+
+    return Boolean(
+      saved?.activeBets?.[key] ||
+      Object.values(
+        saved?.pendingSettlement || {}
+      ).some(
+        e => e?.bets?.[key]
+      )
+    );
+  }
+
   // =====================================
   // PLACE BET
   // =====================================
 
   async function placeBet(data) {
     if (!ready || !game) {
-      return fail(
-        "SERVER_NOT_READY"
-      );
+      return fail("SERVER_NOT_READY");
     }
 
-    if (!BETS_ENABLED) {
-      return fail(
-        "BETTING_DISABLED"
-      );
+    if (!enabled) {
+      return fail("BETTING_DISABLED");
     }
 
     const token = String(
@@ -933,7 +909,7 @@ function attachGreedyLion({
       data?.amount
     );
 
-    const round = Number(
+    const roundNumber = Number(
       data?.roundNumber
     );
 
@@ -941,9 +917,11 @@ function attachGreedyLion({
       !/^[a-f0-9]{32}$/i.test(betId) ||
       !Number.isInteger(foodIndex) ||
       foodIndex < 0 ||
-      foodIndex > 7 ||
-      !CHIPS.includes(amount) ||
-      !Number.isSafeInteger(round)
+      foodIndex >= 8 ||
+      !Number.isSafeInteger(amount) ||
+      amount < MIN_BET ||
+      amount > MAX_BET ||
+      !Number.isSafeInteger(roundNumber)
     ) {
       return fail("INVALID_BET");
     }
@@ -954,121 +932,89 @@ function attachGreedyLion({
       uid = (
         await verifyToken(token)
       ).uid;
-    } catch (e) {
-      return fail(e.message);
+    } catch (error) {
+      return fail(error.message);
+    }
+
+    if (!validId(uid)) {
+      return fail("INVALID_UID");
     }
 
     const key =
       `${uid}_${betId}`;
 
-    const current = (
-      await gameRef()
-        .once("value")
+    const saved = (
+      await gameRef().once("value")
     ).val();
 
     if (
-      !validGame(current) ||
-      Number(
-        current.roundNumber
-      ) !== round ||
-      phase(current) !== "betting"
+      !validGame(saved) ||
+      saved.roundNumber !== roundNumber ||
+      phase(saved) !== "betting"
     ) {
-      return fail(
-        "ROUND_CLOSED"
-      );
+      return fail("ROUND_CLOSED");
     }
 
-    let reserved;
+    let reservation;
 
     try {
-      reserved =
-        await reserveBet(
-          uid,
-          betId,
-          amount,
-          round
-        );
-    } catch (e) {
+      reservation = await reserveBet(
+        uid,
+        betId,
+        amount,
+        roundNumber,
+        foodIndex
+      );
+    } catch (error) {
       console.error(
         "RESERVE ERROR:",
-        e.message
+        error.message
       );
 
-      return fail(
-        "WALLET_ERROR"
-      );
+      return fail("WALLET_ERROR");
     }
 
-    if (!reserved.ok) {
-      return reserved;
+    if (!reservation.ok) {
+      return reservation;
     }
 
-    let reason =
-      "BET_REJECTED";
+    let reason = "BET_REJECTED";
 
     try {
       const tx = await transaction(
         gameRef(),
         current => {
-          if (!validGame(current)) {
-            reason =
-              "GAME_NOT_READY";
-            return;
-          }
-
           if (
-            Number(
-              current.roundNumber
-            ) !== round ||
-            phase(current) !==
-              "betting"
+            !validGame(current) ||
+            current.roundNumber !==
+              roundNumber ||
+            phase(current) !== "betting"
           ) {
-            reason =
-              "ROUND_CLOSED";
+            reason = "ROUND_CLOSED";
             return;
           }
 
           const activeBets = {
-            ...(current.activeBets || {})
+            ...(
+              current.activeBets || {}
+            )
           };
 
           if (activeBets[key]) {
-            reason =
-              "DUPLICATE_BET";
+            reason = "DUPLICATE_BET";
             return;
           }
 
-          const selected =
-            new Set();
-
-          for (
-            const bet of
-            Object.values(activeBets)
-          ) {
-            if (bet.uid === uid) {
-              selected.add(
-                Number(
-                  bet.foodIndex
-                )
-              );
-            }
-          }
-
-          if (
-            !selected.has(foodIndex) &&
-            selected.size >= 6
-          ) {
-            reason =
-              "MAX_SIX_SLOTS";
-            return;
-          }
+          // Repeated bets allowed.
+          // All 8 slots allowed.
+          // Real wallet is the limit.
 
           activeBets[key] = {
             uid,
             betId,
             foodIndex,
             amount,
-            roundNumber: round,
+            roundNumber,
             createdAt: Date.now()
           };
 
@@ -1093,17 +1039,15 @@ function attachGreedyLion({
         );
       }
 
-      game = tx.snapshot.val();
-
       try {
-        await updateBetStatus(
+        await setBetStatus(
           uid,
           betId
         );
-      } catch (e) {
+      } catch (error) {
         console.error(
-          "BET STATUS ERROR:",
-          e.message
+          "SET BET STATUS:",
+          error.message
         );
       }
 
@@ -1112,48 +1056,26 @@ function attachGreedyLion({
         betId,
         foodIndex,
         amount,
-        roundNumber: round,
-        balance:
-          reserved.balance
+        roundNumber,
+        balance: reservation.balance
       };
-    } catch (e) {
+    } catch (error) {
       console.error(
-        "BET ERROR:",
-        e.message
+        "PLACE BET:",
+        error.message
       );
 
       try {
-        const saved = (
-          await gameRef()
-            .once("value")
-        ).val();
-
-        const active = Boolean(
-          saved?.activeBets?.[key]
-        );
-
-        const pending =
-          Object.values(
-            saved?.pendingSettlement || {}
-          ).some(
-            entry =>
-              Boolean(
-                entry?.bets?.[key]
-              )
-          );
-
         if (
-          active ||
-          pending
+          await betRecorded(key)
         ) {
           return {
             ok: true,
             betId,
             foodIndex,
             amount,
-            roundNumber: round,
-            balance:
-              reserved.balance
+            roundNumber,
+            balance: reservation.balance
           };
         }
 
@@ -1177,16 +1099,16 @@ function attachGreedyLion({
   }
 
   // =====================================
-  // WINNER PAYOUT
+  // PAY WINNER ONCE
   // =====================================
 
   async function payWinner(
     uid,
-    round,
+    roundNumber,
     amount
   ) {
     const key =
-      String(round);
+      String(roundNumber);
 
     const tx = await transaction(
       userRef(uid),
@@ -1195,10 +1117,9 @@ function attachGreedyLion({
           return;
         }
 
-        const paid =
-          user.lionPayouts || {};
-
-        if (paid[key]) {
+        if (
+          user.lionPayouts?.[key]
+        ) {
           return;
         }
 
@@ -1208,35 +1129,47 @@ function attachGreedyLion({
         if (
           !validCoins(coins) ||
           !validCoins(amount) ||
-          amount === 0 ||
-          !validCoins(
-            coins + amount
-          )
+          amount <= 0 ||
+          !validCoins(coins + amount)
         ) {
           return;
         }
 
         return {
           ...user,
-          coins:
-            coins + amount,
+          coins: coins + amount,
           lionPayouts: {
-            ...paid,
+            ...(
+              user.lionPayouts || {}
+            ),
             [key]: {
               amount,
-              completedAt:
-                Date.now()
+              completedAt: Date.now()
             }
           }
         };
       }
     );
 
-    return Boolean(
-      tx.committed ||
-      tx.snapshot.val()
-        ?.lionPayouts?.[key]
-    );
+    const paid = tx.snapshot
+      .val()?.lionPayouts?.[key];
+
+    if (
+      paid &&
+      Number(paid.amount) !== amount
+    ) {
+      console.error(
+        "PAYOUT MISMATCH:",
+        uid,
+        roundNumber,
+        paid.amount,
+        amount
+      );
+
+      return false;
+    }
+
+    return Boolean(paid);
   }
 
   // =====================================
@@ -1257,9 +1190,7 @@ function attachGreedyLion({
     try {
       const pending = (
         await gameRef()
-          .child(
-            "pendingSettlement"
-          )
+          .child("pendingSettlement")
           .once("value")
       ).val() || {};
 
@@ -1272,50 +1203,62 @@ function attachGreedyLion({
         }
 
         if (
-          entry.payoutVersion !== 1 &&
-          entry.payoutVersion !== 2
+          ![1, 2, 3].includes(
+            Number(entry.payoutVersion)
+          )
         ) {
           continue;
         }
 
         if (!entry.settled) {
-          let allPaid = true;
+          let paidAll = true;
+          let totals;
+
+          try {
+            totals = payouts(entry);
+          } catch (error) {
+            console.error(
+              "INVALID PAYOUT:",
+              key,
+              error.message
+            );
+
+            continue;
+          }
 
           for (
             const [uid, amount] of
-            Object.entries(
-              payouts(entry)
-            )
+            Object.entries(totals)
           ) {
             try {
               if (
-                !(await payWinner(
-                  uid,
-                  entry.roundNumber,
-                  amount
-                ))
+                !(
+                  await payWinner(
+                    uid,
+                    entry.roundNumber,
+                    amount
+                  )
+                )
               ) {
-                allPaid = false;
+                paidAll = false;
               }
-            } catch (e) {
-              allPaid = false;
+            } catch (error) {
+              paidAll = false;
 
               console.error(
                 "PAYOUT ERROR:",
                 uid,
-                e.message
+                error.message
               );
             }
           }
 
-          if (!allPaid) {
+          if (!paidAll) {
             continue;
           }
 
           await gameRef()
-            .child(
-              "pendingSettlement"
-            )
+            .child("pendingSettlement")
             .child(key)
             .update({
               settled: true,
@@ -1323,37 +1266,55 @@ function attachGreedyLion({
             });
         }
 
-        const history =
-          historyArray(
-            (
-              await gameRef()
-                .child("history")
-                .once("value")
-            ).val()
-          );
+        const history = historyArray(
+          (
+            await gameRef()
+              .child("history")
+              .once("value")
+          ).val()
+        );
 
         const published =
           history.some(
             x =>
-              Number(
-                x.roundNumber
-              ) === Number(
-                entry.roundNumber
-              ) &&
-              x.hasSettledBets ===
-                true
+              Number(x.roundNumber) ===
+                Number(entry.roundNumber) &&
+              x.hasSettledBets === true
           );
 
         if (!published) {
-          await publishWinners(
-            entry
-          );
+          try {
+            await publishWinners(entry);
+          } catch (error) {
+            console.error(
+              "WINNERS PUBLISH:",
+              key,
+              error.message
+            );
+          }
+        }
+
+        // Retain recovery data for 12 rounds
+        // before cleaning completed settlements.
+
+        const currentRound =
+          Number(game?.roundNumber || 0);
+
+        if (
+          published &&
+          Number(entry.roundNumber) <
+            currentRound - 12
+        ) {
+          await gameRef()
+            .child("pendingSettlement")
+            .child(key)
+            .remove();
         }
       }
-    } catch (e) {
+    } catch (error) {
       console.error(
         "SETTLEMENT ERROR:",
-        e.message
+        error.message
       );
     } finally {
       settling = false;
@@ -1361,15 +1322,10 @@ function attachGreedyLion({
   }
 
   // =====================================
-  // GAME SOCKET ONLY
+  // SOCKET GAME EVENTS
   // =====================================
 
   io.on("connection", socket => {
-    console.log(
-      "LION PLAYER:",
-      socket.id
-    );
-
     socket.on(
       "greedy_lion_join",
       async () => {
@@ -1396,21 +1352,16 @@ function attachGreedyLion({
         socket.emit(
           "greedy_lion_clock",
           {
-            roundNumber:
-              s.roundNumber,
-            roundStartsAt:
-              s.roundStartsAt,
-            roundEndsAt:
-              s.roundEndsAt,
-            cycleEndsAt:
-              s.cycleEndsAt,
-            serverTime:
-              s.serverTime,
+            roundNumber: s.roundNumber,
+            roundStartsAt: s.roundStartsAt,
+            roundEndsAt: s.roundEndsAt,
+            cycleEndsAt: s.cycleEndsAt,
+            serverTime: s.serverTime,
             secondsRemaining:
               s.secondsRemaining,
+            phase: s.phase,
             bettingEnabled:
-              s.bettingEnabled,
-            phase: s.phase
+              s.bettingEnabled
           }
         );
       }
@@ -1428,10 +1379,10 @@ function attachGreedyLion({
           reply(
             await placeBet(data)
           );
-        } catch (e) {
+        } catch (error) {
           console.error(
             "SOCKET BET ERROR:",
-            e.message
+            error.message
           );
 
           reply(
@@ -1447,20 +1398,10 @@ function attachGreedyLion({
         socket.leave(ROOM);
       }
     );
-
-    socket.on(
-      "disconnect",
-      () => {
-        console.log(
-          "LION DISCONNECTED:",
-          socket.id
-        );
-      }
-    );
   });
 
   // =====================================
-  // GAME TIMERS
+  // TIMERS
   // =====================================
 
   setInterval(() => {
@@ -1477,27 +1418,21 @@ function attachGreedyLion({
 
     sendClock();
 
-    if (advancing) {
+    if (switching) {
       return;
     }
 
     const recorded =
-      historyArray(
-        game.history
-      ).some(
-        x =>
-          Number(
-            x.roundNumber
-          ) === Number(
-            game.roundNumber
-          )
-      );
+      historyArray(game.history)
+        .some(
+          x =>
+            Number(x.roundNumber) ===
+            Number(game.roundNumber)
+        );
 
     if (
       Date.now() >=
-        Number(
-          game.roundEndsAt
-        ) &&
+        Number(game.roundEndsAt) &&
       !recorded
     ) {
       announceResult().catch(
@@ -1512,7 +1447,7 @@ function attachGreedyLion({
         console.error
       );
     }
-  }, 1000);
+  }, 500);
 
   setInterval(() => {
     settlePending().catch(
@@ -1521,51 +1456,40 @@ function attachGreedyLion({
   }, 1000);
 
   // =====================================
-  // GAME HEALTH
+  // GAME STATUS
   // =====================================
 
   app.get(
     "/api/greedy-lion/status",
     (req, res) => {
       const history =
-        historyArray(
-          game?.history
-        );
+        historyArray(game?.history);
 
       res.json({
         app: "Max Chat",
-        service:
-          "greedy_lion_only",
+        service: "greedy_lion_only",
         status: "online",
         firebaseReady: ready,
         roundNumber:
-          game?.roundNumber ||
-          null,
+          game?.roundNumber || null,
         phase: phase(game),
         secondsRemaining:
-          remaining(),
+          state().secondsRemaining,
         bettingEnabled:
           ready &&
-          BETS_ENABLED &&
-          phase(game) ===
-            "betting",
-        bettingDurationMs:
-          BET_MS,
-        resultDurationMs:
-          RESULT_MS,
+          enabled &&
+          phase(game) === "betting",
+        minBet: MIN_BET,
+        maxBet: MAX_BET,
+        bettingDurationMs: BET_MS,
+        resultDurationMs: RESULT_MS,
         lastResult:
           history.length
-            ? history[
-                history.length - 1
-              ]
+            ? history[history.length - 1]
             : null
       });
     }
   );
-
-  // =====================================
-  // START GAME MODULE
-  // =====================================
 
   console.log(
     "GREEDY LION MODULE ATTACHED"
@@ -1577,9 +1501,7 @@ function attachGreedyLion({
         console.error
       );
     })
-    .catch(
-      console.error
-    );
+    .catch(console.error);
 }
 
 module.exports = {
