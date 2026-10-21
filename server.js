@@ -28,7 +28,7 @@ const ROUND_MS = 25000;
 const RESULT_MS = 6000;
 const CYCLE_MS = ROUND_MS + RESULT_MS;
 const MULTIPLIERS = [45, 5, 5, 10, 15, 5, 5, 25];
-const CHIPS = [100, 1000, 10000, 100000];
+const CHIPS = [100, 1000, 10000, 500000, 1000000];
 
 const BETTING_ENABLED =
   process.env.LION_ENABLE_BETS !== "false";
@@ -463,20 +463,6 @@ async function buildWinnerDetails(entry) {
       try {
         const snapshot = await userRef(uid).once("value");
         user = snapshot.val() || {};
-        // Prefer the actual Firebase Auth profile over non-image avatars.
-        if (!profilePhoto(user) || profileName(user) === "مستخدم") {
-          try {
-            const authUser = await admin.auth().getUser(uid);
-            user = {
-              ...user,
-              name: profileName(user) === "مستخدم"
-                ? (authUser.displayName || "مستخدم") : profileName(user),
-              profileImageUrl: profilePhoto(user) || authUser.photoURL || ""
-            };
-          } catch (authError) {
-            console.warn("AUTH PROFILE UNAVAILABLE", uid, authError.message);
-          }
-        }
       } catch (error) {
         console.error(
           "WINNER PROFILE ERROR:",
