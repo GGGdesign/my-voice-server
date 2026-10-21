@@ -1512,6 +1512,117 @@ function enqueueUserBet(uid, work) {
   return pending;
 }
 
+// Batch rapid clicks into one wallet reservation and one game commit.
+// Every click keeps its unique betId; never issue a success ACK before both
+// durable writes have completed. Per-user queue serializes against old clients.
+async function placeBetBatch(uid, requests, admission) {
+  if (!Array.isArray(requests) || requests.length === 0 || requests.length > 200)
+    return errorResult("INVALID_BET_BATCH");
+  const round = admission.round;
+  const items = [];
+  const ids = new Set();
+  for (const value of requests) {
+    const betId = String(value?.betId || "");
+    const slot = Number(value?.foodIndex);
+    const amount = Number(value?.amount);
+    if (!/^[a-f0-9]{32}$/i.test(betId) || ids.has(betId) ||
+        !Number.isInteger(slot) || slot < 0 || slot > 7 || !CHIPS.includes(amount))
+      return errorResult("INVALID_BET_BATCH");
+    ids.add(betId);
+    items.push({ betId, foodIndex: slot, amount });
+  }
+  const existingGame = game;
+  if (!validGame(existingGame) || existingGame.roundNumber !== round ||
+      historyArray(existingGame.history).some(x => Number(x.roundNumber) === round))
+    return errorResult("ROUND_CLOSED");
+  const occupied = new Set(Object.values(existingGame.activeBets || {})
+    .filter(x => x.uid === uid).map(x => Number(x.foodIndex)));
+  items.forEach(x => occupied.add(x.foodIndex));
+  if (occupied.size > 6) return errorResult("MAX_SIX_SLOTS");
+  const sum = items.reduce((n, x) => n + x.amount, 0);
+  if (!Number.isSafeInteger(sum)) return errorResult("INVALID_BET_BATCH");
+  let reason = "WALLET_REJECTED";
+  const reservation = await walletTransactionReady(userRef(uid), user => {
+    if (!user) { reason = "USER_NOT_FOUND"; return; }
+    const prior = user.lionBets || {};
+    if (items.some(x => prior[x.betId])) { reason = "DUPLICATE_BET"; return; }
+    const coins = Number(user.coins);
+    if (!validCoins(coins)) { reason = "INVALID_WALLET"; return; }
+    if (coins < sum) { reason = "INSUFFICIENT_COINS"; return; }
+    const additions = {};
+    for (const item of items) additions[item.betId] = {
+      amount: item.amount, roundNumber: round, foodIndex: item.foodIndex,
+      status: "reserved", createdAt: Date.now()
+    };
+    return { ...user, coins: coins - sum, lionBets: { ...prior, ...additions } };
+  });
+  if (!reservation.committed) return errorResult(reason);
+  const refundAll = async () => {
+    const tx = await walletTransactionReady(userRef(uid), user => {
+      if (!user) return;
+      const bets = { ...(user.lionBets || {}) };
+      let refund = 0;
+      for (const item of items) {
+        if (bets[item.betId]?.status !== "reserved") continue;
+        refund += item.amount;
+        bets[item.betId] = { ...bets[item.betId], status: "refunded", refundedAt: Date.now() };
+      }
+      if (!refund) return;
+      const coins = Number(user.coins);
+      if (!validCoins(coins) || !Number.isSafeInteger(coins + refund)) return;
+      return { ...user, coins: coins + refund, lionBets: bets };
+    });
+    return tx.committed || items.every(x => tx.snapshot.val()?.lionBets?.[x.betId]?.status === "refunded");
+  };
+  try {
+    let rejection = "BET_REJECTED";
+    const tx = await transactionReady(gameRef(), current => {
+      if (!validGame(current) || current.roundNumber !== round ||
+          historyArray(current.history).some(x => Number(x.roundNumber) === round)) {
+        rejection = "ROUND_CLOSED"; return;
+      }
+      const active = { ...(current.activeBets || {}) };
+      const selected = new Set(Object.values(active).filter(x => x.uid === uid)
+        .map(x => Number(x.foodIndex)));
+      items.forEach(x => selected.add(x.foodIndex));
+      if (selected.size > 6) { rejection = "MAX_SIX_SLOTS"; return; }
+      for (const item of items) {
+        const key = `${uid}_${item.betId}`;
+        if (active[key]) { rejection = "DUPLICATE_BET"; return; }
+        active[key] = { uid, ...item, roundNumber: round, createdAt: admission.receivedAt };
+      }
+      return { ...current, activeBets: active };
+    });
+    if (!tx.committed) return errorResult((await refundAll()) ? rejection : "REFUND_PENDING");
+    game = tx.snapshot.val();
+    // One later status write for the entire batch, never block ACK on it.
+    enqueueUserBet(uid, () => walletTransactionReady(userRef(uid), user => {
+      if (!user) return;
+      const bets = { ...(user.lionBets || {}) };
+      let changed = false;
+      for (const item of items) if (bets[item.betId]?.status === "reserved") {
+        bets[item.betId] = { ...bets[item.betId], status: "accepted" };
+        changed = true;
+      }
+      return changed ? { ...user, lionBets: bets } : undefined;
+    })).catch(e => console.error("BATCH STATUS ERROR", e.message));
+    return { ok: true, roundNumber: round, betIds: items.map(x => x.betId), balance: Number(reservation.snapshot.val()?.coins) };
+  } catch (error) {
+    console.error("BATCH COMMIT ERROR", error.message);
+    // An uncertain game transaction must be checked before any refund.
+    try {
+      const stored = (await gameRef().once("value")).val();
+      const persisted = items.every(x => Boolean(stored?.activeBets?.[`${uid}_${x.betId}`]) ||
+        Object.values(stored?.pendingSettlement || {}).some(entry => Boolean(entry?.bets?.[`${uid}_${x.betId}`])));
+      if (persisted) return { ok: true, roundNumber: round, betIds: items.map(x => x.betId) };
+      const partial = items.some(x => Boolean(stored?.activeBets?.[`${uid}_${x.betId}`]) ||
+        Object.values(stored?.pendingSettlement || {}).some(entry => Boolean(entry?.bets?.[`${uid}_${x.betId}`])));
+      if (partial) return errorResult("BET_STATUS_UNCERTAIN");
+      return errorResult((await refundAll()) ? "BET_FAILED_REFUNDED" : "REFUND_PENDING");
+    } catch { return errorResult("BET_STATUS_UNCERTAIN"); }
+  }
+}
+
 // ==================================================
 // VOICE + SOCKET
 // ==================================================
@@ -1648,6 +1759,24 @@ io.on("connection", socket => {
       }
     }
   );
+
+  socket.on("greedy_lion_place_batch", async (data, ack) => {
+    const reply = typeof ack === "function" ? ack : () => {};
+    const items = data?.bets;
+    const first = Array.isArray(items) && items.length ? items[0] : null;
+    const admission = admissionFor({ ...first, roundNumber: data?.roundNumber });
+    if (!admission.ok) { reply(admission); return; }
+    if (items.length > 200) { reply(errorResult("INVALID_BET_BATCH")); return; }
+    beginIncoming(admission.round);
+    try {
+      const user = await verifyToken(String(data?.idToken || ""));
+      const result = await enqueueUserBet(user.uid, () => placeBetBatch(user.uid, items, admission));
+      reply(result);
+    } catch (e) {
+      console.error("BATCH BET ERROR", e.message);
+      reply(errorResult(e.message === "INVALID_TOKEN" ? "INVALID_TOKEN" : "BET_STATUS_UNCERTAIN"));
+    } finally { endIncoming(admission.round); }
+  });
 
   socket.on("greedy_lion_leave", () => {
     socket.leave(GAME_ROOM);
