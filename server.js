@@ -1373,40 +1373,9 @@ app.post("/api/gifts/send", async (req, res) => {
   };
 
   try {
-    const wallet = await readWallet(
-      uid,
-      "GIFT_REQUEST"
-    );
-
-    if (!wallet.ok) {
-      return giftError(res, 409, wallet.error);
-    }
-
-    const previous =
-      wallet.user.giftPayments?.[requestId];
-
-    if (previous) {
-      if (!sameGiftPayment(previous, request)) {
-        return giftError(
-          res,
-          409,
-          "REQUEST_ID_CONFLICT"
-        );
-      }
-    } else {
-      const exists = await giftReceiverOnSeat(
-        roomId,
-        receiverId
-      );
-
-      if (!exists) {
-        return giftError(
-          res,
-          404,
-          "RECEIVER_NOT_ON_SEAT"
-        );
-      }
-    }
+    // No separate wallet read or seat-approval round trip.
+    // Authentication, exact amount, balance and idempotency are enforced
+    // atomically by chargeGift() below. Recipient is chosen by sender.
 
     const payment = await chargeGift(
       uid,
