@@ -295,7 +295,11 @@ const incomingBets = new Map();
 // Maximum extra draw delay for Firebase operations still in flight.
 // Bets which cannot be committed before the recorded draw are refunded by
 // placeBet/placeBetBatch, never silently counted as winners.
-const MAX_SETTLE_WAIT_MS = 1000;
+// A received wager must never become ROUND_CLOSED merely because an earlier
+// Firebase operation occupied the per-player queue. We deliberately do not
+// publish a draw while a pre-deadline wager is still being committed.
+const MAX_SETTLE_WAIT_MS = 0; // legacy constant (no forced cutoff)
+let lastCloseProgressAt = 0;
 
 function beginIncoming(round) {
   incomingBets.set(round, (incomingBets.get(round) || 0) + 1);
@@ -659,14 +663,22 @@ async function closeRound() {
   try {
     const waiting = incomingBets.get(Number(game.roundNumber)) || 0;
     const deadline = Number(game.roundEndsAt);
-    if (waiting > 0 && Date.now() < deadline + MAX_SETTLE_WAIT_MS) {
-      return;
-    }
     if (waiting > 0) {
-      console.warn("LION DRAW: pending bet confirmations at cutoff", {
-        round: game.roundNumber, pending: waiting,
-        latenessMs: Date.now() - deadline
-      });
+      // Flush admissions still in the 65ms coalescing window NOW.  This is a
+      // hard consistency boundary: never publish a winner while an admitted
+      // bet may subsequently be debited and then rejected as ROUND_CLOSED.
+      for (const key of [...waitingBatchGroups.keys()]) {
+        if (key.endsWith(`:${game.roundNumber}`)) flushBetGroup(key);
+      }
+      if (Date.now() - lastCloseProgressAt > 1000) {
+        lastCloseProgressAt = Date.now();
+        console.log("LION CLOSING ADMITTED BETS", {
+          round: game.roundNumber, pendingRequests: waiting,
+          elapsedMs: Date.now() - deadline
+        });
+      }
+      // Do not draw a random winner before the incoming admitted bets finish.
+      return;
     }
     const win = crypto.randomInt(8);
     const now = Date.now();
