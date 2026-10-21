@@ -130,6 +130,47 @@ async function transactionReady(ref, updater) {
   return ref.transaction(updater, undefined, false);
 }
 
+// Wallet-only compare-and-swap with Firebase REST ETags. Unlike the RTDB SDK
+// transaction callback, REST GET returns the persisted value (not an initial
+// provisional null). If a concurrent update wins, HTTP 412 makes us retry.
+// This never creates a missing wallet and never updates another user's path.
+async function walletTransactionReady(ref, updater) {
+  const base = String(ref.toString());
+  if (!base.startsWith(DB_URL + "/Users/")) {
+    throw new Error("INVALID_WALLET_PATH");
+  }
+  const tokenData = await admin.app().options.credential.getAccessToken();
+  if (!tokenData?.access_token) throw new Error("FIREBASE_ACCESS_TOKEN_MISSING");
+  const url = base + ".json";
+  const headers = { Authorization: `Bearer ${tokenData.access_token}` };
+  const snapshot = value => ({ val: () => value });
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const read = await fetch(url, {
+      method: "GET",
+      headers: { ...headers, "X-Firebase-ETag": "true" },
+      signal: AbortSignal.timeout(12000)
+    });
+    if (!read.ok) throw new Error(`WALLET_READ_HTTP_${read.status}`);
+    const etag = read.headers.get("etag");
+    if (!etag) throw new Error("WALLET_ETAG_MISSING");
+    const before = await read.json();
+    // Return no-op only on real persisted null or an updater rejection.
+    const after = updater(before);
+    if (after === undefined) return { committed: false, snapshot: snapshot(before) };
+    if (!after || typeof after !== "object") throw new Error("INVALID_WALLET_UPDATE");
+    const write = await fetch(url, {
+      method: "PUT",
+      headers: { ...headers, "Content-Type": "application/json", "If-Match": etag },
+      body: JSON.stringify(after),
+      signal: AbortSignal.timeout(12000)
+    });
+    if (write.status === 412) continue;
+    if (!write.ok) throw new Error(`WALLET_WRITE_HTTP_${write.status}`);
+    return { committed: true, snapshot: snapshot(await write.json()) };
+  }
+  throw new Error("WALLET_CONCURRENT_RETRY_EXHAUSTED");
+}
+
 // Cache only already-verified ID tokens for a short period.  A fresh token
 // still gets Firebase revocation verification; cache expires before token exp.
 const verifiedTokens = new Map();
@@ -697,7 +738,7 @@ async function reserveCoins(
   if (!preflight.ok) return preflight;
   let reason = "WALLET_REJECTED";
 
-  const tx = await transactionReady(
+  const tx = await walletTransactionReady(
     userRef(uid),
     user => {
       if (!user) {
@@ -751,7 +792,7 @@ async function reserveCoins(
 }
 
 async function setBetStatus(uid, betId, status) {
-  const tx = await transactionReady(
+  const tx = await walletTransactionReady(
     userRef(uid),
     user => {
       const bet = user?.lionBets?.[betId];
@@ -782,7 +823,7 @@ async function setBetStatus(uid, betId, status) {
 }
 
 async function refundBet(uid, betId) {
-  const tx = await transactionReady(
+  const tx = await walletTransactionReady(
     userRef(uid),
     user => {
       const bet = user?.lionBets?.[betId];
@@ -1038,7 +1079,7 @@ async function creditWinner(
     return false; // Settlement retries; never mark this payout successful.
   }
   // Idempotent credit: each uid/round has a single payout marker.
-  const tx = await transactionReady(
+  const tx = await walletTransactionReady(
     userRef(uid),
     user => {
       if (!user) return;
@@ -1229,7 +1270,7 @@ async function chargeGift(uid, request) {
   if (!preflight.ok) return preflight;
   let reason = "PAYMENT_REJECTED";
 
-  const tx = await transactionReady(
+  const tx = await walletTransactionReady(
     userRef(uid),
     user => {
       if (!user) {
