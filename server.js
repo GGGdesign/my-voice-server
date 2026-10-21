@@ -86,36 +86,30 @@ const userRef = uid => db().ref("Users").child(uid);
 // are upgraded together. Never use this snapshot to approve a bet or gift.
 const walletShadowRef = uid => db().ref("wallets").child(uid);
 const shadowSyncJobs = new Map();
+const SHADOW_IDLE_MS = 650;
 function scheduleWalletShadow(uid) {
-  // One writer per UID. Mark an active job dirty so the latest source value
-  // is re-read after concurrent debits, credits and gifts have completed.
   if (!validId(uid)) return;
-  const running = shadowSyncJobs.get(uid);
-  if (running) { running.dirty = true; return; }
-  const state = { dirty: true };
-  shadowSyncJobs.set(uid, state);
-  (async () => {
+  // A read-only mirror must not contend with gameplay for every tap.
+  // Coalesce all rapid updates, reading the latest authoritative coins.
+  const prior = shadowSyncJobs.get(uid);
+  if (prior) clearTimeout(prior);
+  shadowSyncJobs.set(uid, setTimeout(async () => {
+    shadowSyncJobs.delete(uid);
     try {
-      do {
-        state.dirty = false;
-        const snap = await userRef(uid).child("coins").once("value");
-        const coins = Number(snap.val());
-        if (!snap.exists() || !validCoins(coins)) return;
-        await walletShadowRef(uid).update({
-          coins,
-          source: "Users/coins",
-          role: "shadow_not_authoritative",
-          lastSyncedAt: admin.database.ServerValue.TIMESTAMP
-        });
-      } while (state.dirty);
+      const snap = await userRef(uid).child("coins").once("value");
+      const coins = Number(snap.val());
+      if (!snap.exists() || !validCoins(coins)) return;
+      // A newer mutation while this read was running schedules another sync.
+      // Only the final sync is intended as the mirror; it never authorizes wagers.
+      await walletShadowRef(uid).update({
+        coins, source: "Users/coins", role: "shadow_not_authoritative",
+        lastSyncedAt: admin.database.ServerValue.TIMESTAMP
+      });
     } catch (error) {
       console.error("WALLET SHADOW SYNC ERROR:", error.message);
-    } finally {
-      if (shadowSyncJobs.get(uid) === state) shadowSyncJobs.delete(uid);
     }
-  })();
+  }, SHADOW_IDLE_MS));
 }
-
 
 // Verify that the record is visible before starting a parent-node transaction.
 // Firebase RTDB may initially invoke a transaction updater with null while
@@ -1049,8 +1043,7 @@ async function placeBet(data, admission) {
     // a third Firebase transaction merely annotates the accepted bet ledger.
     // Display confirms from the game commit ACK immediately. Status syncing
     // happens behind later queued bets, avoiding extra wallet CAS collisions.
-    enqueueUserBet(uid, () => setBetStatus(uid, betId, "accepted"))
-      .catch(error => console.error("BET STATUS ERROR:", error.message));
+    scheduleAcceptedStatuses(uid, [betId]);
 
     return {
       ok: true,
@@ -1561,6 +1554,37 @@ function enqueueUserBet(uid, work) {
   return pending;
 }
 
+// Bookkeeping must not compete with actual wallet debits on every tap.
+// Batch status changes after a short quiet period, preserving the durable bet IDs.
+const pendingStatusByUser = new Map();
+function scheduleAcceptedStatuses(uid, ids) {
+  if (!Array.isArray(ids) || !ids.length) return;
+  let job = pendingStatusByUser.get(uid);
+  if (!job) {
+    job = { ids: new Set(), timer: null };
+    pendingStatusByUser.set(uid, job);
+  }
+  for (const id of ids) job.ids.add(id);
+  clearTimeout(job.timer);
+  job.timer = setTimeout(() => {
+    if (pendingStatusByUser.get(uid) !== job) return;
+    pendingStatusByUser.delete(uid);
+    const betIds = [...job.ids];
+    enqueueUserBet(uid, () => walletTransactionReady(userRef(uid), user => {
+      if (!user) return;
+      const bets = { ...(user.lionBets || {}) };
+      let changed = false;
+      for (const id of betIds) {
+        if (bets[id]?.status === "reserved") {
+          bets[id] = { ...bets[id], status: "accepted", updatedAt: Date.now() };
+          changed = true;
+        }
+      }
+      return changed ? { ...user, lionBets: bets } : undefined;
+    })).catch(error => console.error("BET STATUS BATCH ERROR:", error.message));
+  }, 900);
+}
+
 // Merge nearby client batches for the same authenticated user and round.
 // A single durable wallet/game commit can cover many rapid clicks; each caller
 // receives its own ACK only after that commit. Never merge across rounds.
@@ -1691,17 +1715,8 @@ async function placeBetBatch(uid, requests, admission) {
     });
     if (!tx.committed) return errorResult((await refundAll()) ? rejection : "REFUND_PENDING");
     game = tx.snapshot.val();
-    // One later status write for the entire batch, never block ACK on it.
-    enqueueUserBet(uid, () => walletTransactionReady(userRef(uid), user => {
-      if (!user) return;
-      const bets = { ...(user.lionBets || {}) };
-      let changed = false;
-      for (const item of items) if (bets[item.betId]?.status === "reserved") {
-        bets[item.betId] = { ...bets[item.betId], status: "accepted" };
-        changed = true;
-      }
-      return changed ? { ...user, lionBets: bets } : undefined;
-    })).catch(e => console.error("BATCH STATUS ERROR", e.message));
+    // Confirmation follows durable wallet debit + game entry, not this optional status mirror.
+    scheduleAcceptedStatuses(uid, items.map(x => x.betId));
     return { ok: true, roundNumber: round, betIds: items.map(x => x.betId), balance: Number(reservation.snapshot.val()?.coins) };
   } catch (error) {
     console.error("BATCH COMMIT ERROR", error.message);
@@ -1915,7 +1930,7 @@ setInterval(async () => {
   } finally {
     timerBusy = false;
   }
-}, 500);
+}, 150);
 
 // Faster fallback for settlement failures.
 setInterval(() => {
