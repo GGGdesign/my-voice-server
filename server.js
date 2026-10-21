@@ -1071,7 +1071,7 @@ async function settlePending() {
         const totals = calculatePayouts(entry);
         // Profile loading and each player's independent wallet credit run
         // concurrently. Each credit is still idempotent per uid/round.
-        const profilesPromise = buildWinnerDetails(entry);
+        // Credit wallets first; fetching profile photos must never delay winnings.
         const payments = await Promise.all(Object.entries(totals).map(
           async ([uid, amount]) => {
             try {
@@ -1086,7 +1086,8 @@ async function settlePending() {
         await gameRef().child("pendingSettlement")
           .child(key).update({ settled: true, settledAt: Date.now() });
         fullySettled = true;
-        preparedWinners = await profilesPromise;
+        // Winner names/photos are display-only and happen after durable credits.
+        preparedWinners = await buildWinnerDetails(entry);
       }
 
       const hist = historyArray((await gameRef().child("history").once("value")).val());
@@ -1599,6 +1600,30 @@ setInterval(async () => {
 setInterval(() => {
   settlePending().catch(console.error);
 }, 1000);
+
+// Authenticated wallet diagnostic. Does not change credits or account identity.
+app.get("/api/account/status", async (req, res) => {
+  try {
+    const decoded = await verifyHttpUser(req);
+    const snapshot = await userRef(decoded.uid).once("value");
+    const data = snapshot.val();
+    if (!data || typeof data !== "object") {
+      return res.status(404).json({
+        ok: false, error: "AUTH_UID_HAS_NO_USERS_RECORD",
+        hint: "Check Users/<FirebaseAuth.uid>, not the public customId",
+        authenticatedUid: decoded.uid
+      });
+    }
+    return res.json({
+      ok: true, authenticatedUid: decoded.uid,
+      publicId: String(data.customId || data.userId || ""),
+      walletValid: validCoins(Number(data.coins)),
+      accountFound: true
+    });
+  } catch (error) {
+    return res.status(401).json({ ok: false, error: error.message });
+  }
+});
 
 // ==================================================
 // HEALTH
