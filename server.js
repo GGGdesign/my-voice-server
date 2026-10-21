@@ -81,6 +81,30 @@ function db() {
 const gameRef = () => db().ref(GAME_PATH);
 const userRef = uid => db().ref("Users").child(uid);
 
+// Verify that the record is visible before starting a parent-node transaction.
+// Firebase RTDB may initially invoke a transaction updater with null while
+// loading its local state. Never interpret that provisional null as proof that
+// the authenticated user does not exist.
+async function walletPreflight(uid) {
+  const snapshot = await userRef(uid).once("value");
+  if (!snapshot.exists()) {
+    console.error("WALLET RECORD MISSING", {
+      authProject: admin.app().options.credential?.projectId || "unknown",
+      databaseURL: DB_URL,
+      // Don't log names, emails, coins or tokens.
+      uidSuffix: String(uid).slice(-5)
+    });
+    return errorResult("USER_NOT_FOUND");
+  }
+  const user = snapshot.val();
+  if (!user || typeof user !== "object" ||
+      !validCoins(Number(user.coins))) {
+    return errorResult("INVALID_WALLET");
+  }
+  return { ok: true };
+}
+
+
 function validId(value) {
   return typeof value === "string" &&
     /^[a-zA-Z0-9_-]{1,100}$/.test(value);
@@ -666,16 +690,18 @@ async function reserveCoins(
 ) {
   // Unlimited repeated bets per selected slot, subject only to balance and
   // the six-DISTINCT-slots rule enforced in placeBet.
-  // One atomic wallet transaction: do not do an extra round-trip
-  // to read the same wallet before attempting this debit.
+  // Prefetch once to distinguish a genuinely missing record from the
+  // Firebase transaction updater's provisional null on an uncached node.
+  // The actual debit and available-balance check remain atomic below.
+  const preflight = await walletPreflight(uid);
+  if (!preflight.ok) return preflight;
   let reason = "WALLET_REJECTED";
 
   const tx = await transactionReady(
     userRef(uid),
     user => {
       if (!user) {
-        reason = "USER_NOT_FOUND";
-        console.warn("BET WALLET: Auth UID has no Users record; check service-account Firebase project and DB_URL");
+        reason = "WALLET_TRANSACTION_EMPTY";
         return;
       }
 
@@ -1005,6 +1031,12 @@ async function creditWinner(
 ) {
   const key = String(roundNumber);
 
+  // Read the existing wallet once before its atomic payout transaction.
+  const preflight = await walletPreflight(uid);
+  if (!preflight.ok) {
+    console.error("PAYOUT WALLET PREFLIGHT:", preflight.error);
+    return false; // Settlement retries; never mark this payout successful.
+  }
   // Idempotent credit: each uid/round has a single payout marker.
   const tx = await transactionReady(
     userRef(uid),
@@ -1193,13 +1225,15 @@ async function giftReceiverOnSeat(
 async function chargeGift(uid, request) {
   // /api/gifts/send already checked the sender and possible retry. The
   // transaction itself checks the actual balance against concurrent charges.
+  const preflight = await walletPreflight(uid);
+  if (!preflight.ok) return preflight;
   let reason = "PAYMENT_REJECTED";
 
   const tx = await transactionReady(
     userRef(uid),
     user => {
       if (!user) {
-        reason = "USER_NOT_FOUND";
+        reason = "WALLET_TRANSACTION_EMPTY";
         return;
       }
 
@@ -1677,6 +1711,8 @@ httpServer.listen(PORT, async () => {
   console.log("MAX CHAT SERVER RUNNING:", PORT);
   console.log("BETTING ENABLED:", BETTING_ENABLED);
   console.log("GIFTS ENABLED:", GIFTS_ENABLED);
+  console.log("FIREBASE DATABASE URL:", DB_URL);
+  console.log("FIREBASE APP PROJECT:", admin.app().options.projectId || "see-service-account");
 
   await startGame();
 
