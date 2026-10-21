@@ -306,8 +306,14 @@ function beginIncoming(round) {
 }
 function endIncoming(round) {
   const count = (incomingBets.get(round) || 0) - 1;
-  if (count <= 0) incomingBets.delete(round);
-  else incomingBets.set(round, count);
+  if (count <= 0) {
+    incomingBets.delete(round);
+    // Start crediting without waiting for the one-second fallback timer.
+    // Only durable bets can be credited; settlePending is idempotent.
+    const drawn = historyArray(game?.history).some(
+      item => Number(item.roundNumber) === Number(round));
+    if (drawn) setImmediate(() => settlePending().catch(console.error));
+  } else incomingBets.set(round, count);
 }
 function admissionFor(data) {
   if (!firebaseReady || !game) return errorResult("SERVER_NOT_READY");
