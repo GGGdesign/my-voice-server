@@ -1518,6 +1518,53 @@ function enqueueUserBet(uid, work) {
   return pending;
 }
 
+// Merge nearby client batches for the same authenticated user and round.
+// A single durable wallet/game commit can cover many rapid clicks; each caller
+// receives its own ACK only after that commit. Never merge across rounds.
+const waitingBatchGroups = new Map();
+const SERVER_BATCH_MS = 65;
+const MAX_SERVER_BATCH_BETS = 200;
+function collectBetBatch(uid, items, admission) {
+  return new Promise(resolve => {
+    const key = `${uid}:${admission.round}`;
+    let group = waitingBatchGroups.get(key);
+    if (group && group.count + items.length > MAX_SERVER_BATCH_BETS) {
+      flushBetGroup(key);
+      group = null;
+    }
+    if (!group) {
+      group = { uid, round: admission.round, receivedAt: admission.receivedAt,
+        items: [], calls: [], count: 0, timer: null };
+      waitingBatchGroups.set(key, group);
+      group.timer = setTimeout(() => flushBetGroup(key), SERVER_BATCH_MS);
+    }
+    group.items.push(...items);
+    group.calls.push({ resolve, betIds: items.map(x => String(x.betId)) });
+    group.count += items.length;
+    group.receivedAt = Math.min(group.receivedAt, admission.receivedAt);
+    if (group.count >= MAX_SERVER_BATCH_BETS ||
+        Date.now() >= Number(game?.roundEndsAt || 0) - 90) flushBetGroup(key);
+  });
+}
+function flushBetGroup(key) {
+  const group = waitingBatchGroups.get(key);
+  if (!group) return;
+  waitingBatchGroups.delete(key);
+  clearTimeout(group.timer);
+  const queued = enqueueUserBet(group.uid, () => placeBetBatch(
+    group.uid, group.items, { ok: true, round: group.round,
+      receivedAt: group.receivedAt }
+  ));
+  queued.then(result => {
+    for (const call of group.calls) {
+      call.resolve(result.ok ? { ...result, betIds: call.betIds } : result);
+    }
+  }, err => {
+    console.error("MERGED BET ERROR", err.message);
+    for (const call of group.calls) call.resolve(errorResult("BET_STATUS_UNCERTAIN"));
+  });
+}
+
 // Batch rapid clicks into one wallet reservation and one game commit.
 // Every click keeps its unique betId; never issue a success ACK before both
 // durable writes have completed. Per-user queue serializes against old clients.
@@ -1776,7 +1823,7 @@ io.on("connection", socket => {
     beginIncoming(admission.round);
     try {
       const user = await verifyToken(String(data?.idToken || ""));
-      const result = await enqueueUserBet(user.uid, () => placeBetBatch(user.uid, items, admission));
+      const result = await collectBetBatch(user.uid, items, admission);
       reply(result);
     } catch (e) {
       console.error("BATCH BET ERROR", e.message);
