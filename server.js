@@ -661,24 +661,10 @@ async function closeRound() {
   if (!firebaseReady || !game || roundProcessing) return;
   roundProcessing = true;
   try {
-    const waiting = incomingBets.get(Number(game.roundNumber)) || 0;
-    const deadline = Number(game.roundEndsAt);
-    if (waiting > 0) {
-      // Flush admissions still in the 65ms coalescing window NOW.  This is a
-      // hard consistency boundary: never publish a winner while an admitted
-      // bet may subsequently be debited and then rejected as ROUND_CLOSED.
-      for (const key of [...waitingBatchGroups.keys()]) {
-        if (key.endsWith(`:${game.roundNumber}`)) flushBetGroup(key);
-      }
-      if (Date.now() - lastCloseProgressAt > 1000) {
-        lastCloseProgressAt = Date.now();
-        console.log("LION CLOSING ADMITTED BETS", {
-          round: game.roundNumber, pendingRequests: waiting,
-          elapsedMs: Date.now() - deadline
-        });
-      }
-      // Do not draw a random winner before the incoming admitted bets finish.
-      return;
+    // Draws are clock-driven. Pre-deadline wallet writes continue asynchronously
+    // and are attached to the already-drawn round for later settlement.
+    for (const key of [...waitingBatchGroups.keys()]) {
+      if (key.endsWith(`:${game.roundNumber}`)) flushBetGroup(key);
     }
     const win = crypto.randomInt(8);
     const now = Date.now();
@@ -695,16 +681,16 @@ async function closeRound() {
         roundNumber,
         winningIndex: win,
         completedAt: now,
-        hasSettledBets: Object.keys(bets).length === 0,
+        hasSettledBets: false,
         winners: [],
         topWinners: []
       };
-      if (Object.keys(bets).length > 0) {
-        pending[String(roundNumber)] = {
-          roundNumber, winningIndex: win, completedAt: now,
-          payoutVersion: 2, settled: false, bets
-        };
-      }
+      // Keep an open settlement record even if every wallet write is still
+      // in flight; those authenticated requests join this record later.
+      pending[String(roundNumber)] = {
+        roundNumber, winningIndex: win, completedAt: now,
+        payoutVersion: 2, settled: false, bets
+      };
       return {
         ...current,
         // Always give the result six full seconds even after slow bets.
@@ -1179,6 +1165,10 @@ async function settlePending() {
 
     for (const [key, entry] of Object.entries(pending)) {
       if (!entry) continue;
+      // Never settle until all requests received before this round's deadline
+      // have finished writing to the wallet and the game settlement ledger.
+      if ((incomingBets.get(Number(entry.roundNumber)) || 0) > 0 ||
+          [...waitingBatchGroups.keys()].some(k => k.endsWith(`:${entry.roundNumber}`))) continue;
 
       if (
         entry.payoutVersion !== 1 &&
@@ -1664,10 +1654,17 @@ async function placeBetBatch(uid, requests, admission) {
     items.push({ betId, foodIndex: slot, amount });
   }
   const existingGame = game;
-  if (!validGame(existingGame) || existingGame.roundNumber !== round ||
-      historyArray(existingGame.history).some(x => Number(x.roundNumber) === round))
+  // The request was admitted before the deadline. The round may now be
+  // drawn (or already advanced), but its unsettled ledger remains open.
+  if (!validGame(existingGame) || round > existingGame.roundNumber ||
+      (round < existingGame.roundNumber &&
+       !existingGame.pendingSettlement?.[String(round)]))
     return errorResult("ROUND_CLOSED");
-  const occupied = new Set(Object.values(existingGame.activeBets || {})
+  const originalBets = round === existingGame.roundNumber &&
+    !existingGame.pendingSettlement?.[String(round)]
+    ? existingGame.activeBets || {}
+    : existingGame.pendingSettlement?.[String(round)]?.bets || {};
+  const occupied = new Set(Object.values(originalBets)
     .filter(x => x.uid === uid).map(x => Number(x.foodIndex)));
   items.forEach(x => occupied.add(x.foodIndex));
   if (occupied.size > 6) return errorResult("MAX_SIX_SLOTS");
@@ -1709,20 +1706,35 @@ async function placeBetBatch(uid, requests, admission) {
   try {
     let rejection = "BET_REJECTED";
     const tx = await transactionReady(gameRef(), current => {
-      if (!validGame(current) || current.roundNumber !== round ||
-          historyArray(current.history).some(x => Number(x.roundNumber) === round)) {
+      if (!validGame(current) || current.roundNumber < round) {
         rejection = "ROUND_CLOSED"; return;
       }
-      const active = { ...(current.activeBets || {}) };
+      const drawn = historyArray(current.history).some(
+        x => Number(x.roundNumber) === round);
+      const key = String(round);
+      const settling = current.pendingSettlement?.[key];
+      if ((drawn && !settling) || settling?.settled === true) {
+        rejection = "ROUND_SETTLED"; return;
+      }
+      const active = { ...(drawn ? settling.bets : current.activeBets || {}) };
       const selected = new Set(Object.values(active).filter(x => x.uid === uid)
         .map(x => Number(x.foodIndex)));
       items.forEach(x => selected.add(x.foodIndex));
       if (selected.size > 6) { rejection = "MAX_SIX_SLOTS"; return; }
       for (const item of items) {
-        const key = `${uid}_${item.betId}`;
-        if (active[key]) { rejection = "DUPLICATE_BET"; return; }
-        active[key] = { uid, ...item, roundNumber: round, createdAt: admission.receivedAt };
+        const betKey = `${uid}_${item.betId}`;
+        if (active[betKey]) { rejection = "DUPLICATE_BET"; return; }
+        active[betKey] = {
+          uid, ...item, roundNumber: round, createdAt: admission.receivedAt
+        };
       }
+      if (drawn) return {
+        ...current,
+        pendingSettlement: {
+          ...current.pendingSettlement,
+          [key]: { ...settling, bets: active }
+        }
+      };
       return { ...current, activeBets: active };
     });
     if (!tx.committed) return errorResult((await refundAll()) ? rejection : "REFUND_PENDING");
@@ -1872,7 +1884,9 @@ io.on("connection", socket => {
         // Validate account identity before queuing. The original reception time
         // was already captured in admissionFor().
         const decoded = await verifyToken(String(data?.idToken || ""));
-        const result = await enqueueUserBet(decoded.uid, () => placeBet(data, admission));
+        const result = await collectBetBatch(decoded.uid, [{
+          betId: data.betId, foodIndex: data.foodIndex, amount: data.amount
+        }], admission);
         reply(result);
       } catch (error) {
         console.error("SOCKET BET ERROR:", error.message);
