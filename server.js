@@ -664,6 +664,8 @@ async function reserveCoins(
   amount,
   roundNumber
 ) {
+  // Unlimited repeated bets per selected slot, subject only to balance and
+  // the six-DISTINCT-slots rule enforced in placeBet.
   // One atomic wallet transaction: do not do an extra round-trip
   // to read the same wallet before attempting this debit.
   let reason = "WALLET_REJECTED";
@@ -673,6 +675,7 @@ async function reserveCoins(
     user => {
       if (!user) {
         reason = "USER_NOT_FOUND";
+        console.warn("BET WALLET: Auth UID has no Users record; check service-account Firebase project and DB_URL");
         return;
       }
 
@@ -1083,6 +1086,14 @@ async function settlePending() {
           }
         ));
         if (payments.some(ok => !ok)) continue;
+        // Tell connected clients as soon as the actual Firebase wallet credits
+        // have succeeded. This is informational only: the wallet listener is
+        // still the authoritative display of the new balance.
+        io.to(GAME_ROOM).emit("greedy_lion_payouts_credited", {
+          roundNumber: Number(entry.roundNumber),
+          creditedAt: Date.now(),
+          payouts: totals
+        });
         await gameRef().child("pendingSettlement")
           .child(key).update({ settled: true, settledAt: Date.now() });
         fullySettled = true;
