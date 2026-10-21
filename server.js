@@ -313,7 +313,12 @@ function endIncoming(round) {
     const drawn = historyArray(game?.history).some(
       item => Number(item.roundNumber) === Number(round));
     if (drawn) setImmediate(() => settlePending().catch(console.error));
-  } else incomingBets.set(round, count);
+  } else {
+    incomingBets.set(round, count);
+    const drawn = historyArray(game?.history).some(
+      item => Number(item.roundNumber) === Number(round));
+    if (drawn) setImmediate(() => settlePending().catch(console.error));
+  }
 }
 function admissionFor(data) {
   if (!firebaseReady || !game) return errorResult("SERVER_NOT_READY");
@@ -1106,158 +1111,121 @@ async function placeBet(data, admission) {
 // PAYOUTS
 // ==================================================
 
-async function creditWinner(
-  uid,
-  roundNumber,
-  amount
-) {
+// Credit individual winning bets as soon as they are durably registered.
+// Each bet id is a durable idempotency key within the SAME atomic wallet CAS.
+// Older round-level payouts without bet markers are treated as already paid.
+async function creditWinningBets(uid, roundNumber, winningBets) {
+  if (!winningBets.length) return { ok: true, credited: 0 };
   const key = String(roundNumber);
-
-  // Read the existing wallet once before its atomic payout transaction.
-  // Idempotent credit: each uid/round has a single payout marker.
-  const tx = await walletTransactionReady(
-    userRef(uid),
-    user => {
-      if (!user) return;
-
-      const payouts = user.lionPayouts || {};
-
-      if (payouts[key]) return;
-
-      const coins = Number(user.coins);
-
-      if (
-        !validCoins(coins) ||
-        !validCoins(amount) ||
-        amount === 0 ||
-        !Number.isSafeInteger(coins + amount)
-      ) return;
-
-      return {
-        ...user,
-        coins: coins + amount,
-        lionPayouts: {
-          ...payouts,
-          [key]: {
-            amount,
-            completedAt: Date.now()
-          }
-        }
-      };
+  let newlyCredited = 0;
+  const tx = await walletTransactionReady(userRef(uid), user => {
+    newlyCredited = 0;
+    if (!user) return;
+    const payouts = user.lionPayouts || {};
+    const previous = payouts[key];
+    const markers = user.lionPaidBetIds || {};
+    // Migration safety: the old implementation paid the whole round at once.
+    if (previous && !previous.betIds) return;
+    const already = { ...(previous?.betIds || {}) };
+    for (const bet of winningBets) {
+      const id = String(bet.betId);
+      if (already[id] || markers[id]) continue;
+      const value = Number(bet.amount) * MULTIPLIERS[Number(bet.foodIndex)];
+      if (!validCoins(value) || value === 0 ||
+          !Number.isSafeInteger(newlyCredited + value)) return;
+      newlyCredited += value;
+      already[id] = true;
     }
-  );
-
-  return Boolean(
-    tx.committed ||
-    tx.snapshot.val()?.lionPayouts?.[key]
-  );
+    if (!newlyCredited) return;
+    const coins = Number(user.coins);
+    const oldAmount = Number(previous?.amount || 0);
+    if (!validCoins(coins) || !validCoins(oldAmount) ||
+        !Number.isSafeInteger(coins + newlyCredited) ||
+        !Number.isSafeInteger(oldAmount + newlyCredited)) return;
+    return {
+      ...user,
+      coins: coins + newlyCredited,
+      lionPayouts: {
+        ...payouts,
+        [key]: { amount: oldAmount + newlyCredited, completedAt: Date.now(), betIds: already }
+      }
+    };
+  });
+  if (tx.committed) return { ok: true, credited: newlyCredited };
+  const prior = tx.snapshot.val()?.lionPayouts?.[key];
+  if (prior && !prior.betIds) return { ok: true, credited: 0 };
+  if (winningBets.every(bet => prior?.betIds?.[String(bet.betId)]))
+    return { ok: true, credited: 0 };
+  return { ok: false, credited: 0 };
 }
 
 async function settlePending() {
-  if (
-    !firebaseReady ||
-    !game ||
-    settlementProcessing
-  ) return;
-
+  if (!firebaseReady || !game || settlementProcessing) return;
   settlementProcessing = true;
-
   try {
-    const snapshot = await gameRef()
-      .child("pendingSettlement")
-      .once("value");
-
+    const snapshot = await gameRef().child("pendingSettlement").once("value");
     const pending = snapshot.val() || {};
-
     for (const [key, entry] of Object.entries(pending)) {
-      if (!entry) continue;
-      // Never settle until all requests received before this round's deadline
-      // have finished writing to the wallet and the game settlement ledger.
-      if ((incomingBets.get(Number(entry.roundNumber)) || 0) > 0 ||
-          [...waitingBatchGroups.keys()].some(k => k.endsWith(`:${entry.roundNumber}`))) continue;
-
-      if (
-        entry.payoutVersion !== 1 &&
-        entry.payoutVersion !== 2
-      ) continue;
-
-      let preparedWinners = null;
-      let fullySettled = entry.settled === true;
-      if (!entry.settled) {
-        const totals = calculatePayouts(entry);
-        // Profile loading and each player's independent wallet credit run
-        // concurrently. Each credit is still idempotent per uid/round.
-        // Credit wallets first; fetching profile photos must never delay winnings.
-        const winnersTask = buildWinnerDetails(entry).catch(error => {
-          console.warn("WINNER PROFILE RETRY", error.message);
-          return null;
-        });
-        const payments = await Promise.all(Object.entries(totals).map(
-          async ([uid, amount]) => {
-            try {
-              return await creditWinner(uid, entry.roundNumber, amount);
-            } catch (error) {
-              console.error("PAYOUT ERROR:", uid, error.message);
-              return false;
-            }
-          }
-        ));
-        if (payments.some(ok => !ok)) continue;
-        // Tell connected clients as soon as the actual Firebase wallet credits
-        // have succeeded. This is informational only: the wallet listener is
-        // still the authoritative display of the new balance.
-        io.to(GAME_ROOM).emit("greedy_lion_payouts_credited", {
-          roundNumber: Number(entry.roundNumber),
-          creditedAt: Date.now(),
-          payouts: totals
-        });
-        await gameRef().child("pendingSettlement")
-          .child(key).update({ settled: true, settledAt: Date.now() });
-        fullySettled = true;
-        // Winner names/photos are display-only and happen after durable credits.
-        preparedWinners = await winnersTask;
+      if (!entry || ![1, 2].includes(entry.payoutVersion)) continue;
+      const round = Number(entry.roundNumber);
+      const winnerIndex = Number(entry.winningIndex);
+      // Incoming requests may still commit, but they never block payouts for
+      // winning bets which have already been committed into this ledger.
+      const grouped = new Map();
+      for (const [ledgerId, bet] of Object.entries(entry.bets || {})) {
+        if (Number(bet.foodIndex) !== winnerIndex || !validId(bet.uid)) continue;
+        const amount = Number(bet.amount);
+        if (!validCoins(amount) || amount <= 0) continue;
+        const betId = String(bet.betId || ledgerId);
+        const list = grouped.get(bet.uid) || [];
+        list.push({ betId, foodIndex: winnerIndex, amount });
+        grouped.set(bet.uid, list);
       }
-
+      let allPaid = true;
+      const changes = {};
+      const payments = await Promise.all([...grouped.entries()].map(async ([uid, bets]) => {
+        try {
+          const result = await creditWinningBets(uid, round, bets);
+          return { uid, ...result };
+        } catch (error) {
+          console.error("PAYOUT ERROR", uid, error.message);
+          return { uid, ok: false, credited: 0 };
+        }
+      }));
+      for (const payment of payments) {
+        if (!payment.ok) allPaid = false;
+        if (payment.credited > 0) changes[payment.uid] = payment.credited;
+      }
+      if (Object.keys(changes).length) {
+        io.to(GAME_ROOM).emit("greedy_lion_payouts_credited", {
+          roundNumber: round, creditedAt: Date.now(), payouts: changes
+        });
+      }
+      // Do not finalize TOP/history until every pre-deadline request has
+      // reached a durable success/failure; additional winning bets can arrive.
+      const stillIncoming = (incomingBets.get(round) || 0) > 0 ||
+        [...waitingBatchGroups.keys()].some(k => k.endsWith(`:${round}`));
+      if (stillIncoming || !allPaid) continue;
+      if (entry.settled !== true) {
+        await gameRef().child("pendingSettlement").child(key).update({
+          settled: true, settledAt: Date.now()
+        });
+      }
       const hist = historyArray((await gameRef().child("history").once("value")).val());
       const published = hist.some(item =>
-        Number(item.roundNumber) === Number(entry.roundNumber) &&
-        item.hasSettledBets === true
-      );
+        Number(item.roundNumber) === round && item.hasSettledBets === true);
       if (!published) {
-        try {
-          await publishRoundWinners(entry, preparedWinners);
-        } catch (error) {
-          console.error("WINNER DISPLAY ERROR:", error.message);
-        }
+        try { await publishRoundWinners(entry); }
+        catch (error) { console.error("WINNER DISPLAY ERROR", error.message); }
       }
-
-      // Do not keep every past round's bet list inside greedyLionGame forever.
-      // The old implementation accumulated all settled rounds, making EACH
-      // new bet's game-root transaction progressively slower. The user payout
-      // ledger and published history are already durable by this point.
-      const latestHistory = historyArray(
-        (await gameRef().child("history").once("value")).val()
-      );
-      const safelyPublished = latestHistory.some(item =>
-        Number(item.roundNumber) === Number(entry.roundNumber) &&
-        item.hasSettledBets === true
-      );
-      const beyondHistory = Number(entry.roundNumber) <
-        Number(game?.roundNumber || 0) - 8;
-      if (fullySettled && (safelyPublished || beyondHistory)) {
+      const latest = historyArray((await gameRef().child("history").once("value")).val());
+      const safe = latest.some(item => Number(item.roundNumber) === round && item.hasSettledBets === true);
+      if (safe || round < Number(game?.roundNumber || 0) - 8)
         await gameRef().child("pendingSettlement").child(key).remove();
-      }
-
-      console.log("ROUND SETTLED:", key);
     }
   } catch (error) {
-    console.error(
-      "SETTLEMENT ERROR:",
-      error.message
-    );
-  } finally {
-    settlementProcessing = false;
-  }
+    console.error("SETTLEMENT ERROR:", error.message);
+  } finally { settlementProcessing = false; }
 }
 
 // ==================================================
@@ -1590,7 +1558,7 @@ function scheduleAcceptedStatuses(uid, ids) {
       }
       return changed ? { ...user, lionBets: bets } : undefined;
     })).catch(error => console.error("BET STATUS BATCH ERROR:", error.message));
-  }, 900);
+  }, 1400);
 }
 
 // Merge nearby client batches for the same authenticated user and round.
