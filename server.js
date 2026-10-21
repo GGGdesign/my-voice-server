@@ -255,7 +255,10 @@ let settlementProcessing = false;
 const incomingBets = new Map();
 // Keep a small grace period for requests that reached the server before the
 // cutoff; never stall the spin for 20 seconds when a Firebase request hangs.
-const MAX_SETTLE_WAIT_MS = 12000;
+// Maximum extra draw delay for Firebase operations still in flight.
+// Bets which cannot be committed before the recorded draw are refunded by
+// placeBet/placeBetBatch, never silently counted as winners.
+const MAX_SETTLE_WAIT_MS = 1000;
 
 function beginIncoming(round) {
   incomingBets.set(round, (incomingBets.get(round) || 0) + 1);
@@ -618,9 +621,15 @@ async function closeRound() {
   roundProcessing = true;
   try {
     const waiting = incomingBets.get(Number(game.roundNumber)) || 0;
-    if (waiting > 0 && Date.now() < Number(game.roundEndsAt) + MAX_SETTLE_WAIT_MS) {
-      // Protect all bets that arrived while the round was still open.
+    const deadline = Number(game.roundEndsAt);
+    if (waiting > 0 && Date.now() < deadline + MAX_SETTLE_WAIT_MS) {
       return;
+    }
+    if (waiting > 0) {
+      console.warn("LION DRAW: pending bet confirmations at cutoff", {
+        round: game.roundNumber, pending: waiting,
+        latenessMs: Date.now() - deadline
+      });
     }
     const win = crypto.randomInt(8);
     const now = Date.now();
@@ -659,7 +668,14 @@ async function closeRound() {
     game = tx.snapshot.val();
     const result = historyArray(game.history)
       .find(item => Number(item.roundNumber) === game.roundNumber);
-    if (result) io.to(GAME_ROOM).emit("greedy_lion_round_result", result);
+    if (result) {
+      io.to(GAME_ROOM).emit("greedy_lion_round_result", result);
+      console.log("LION RESULT PUBLISHED", {
+        round: result.roundNumber,
+        delayMs: Date.now() - Number(game.roundEndsAt),
+        inFlight: incomingBets.get(Number(game.roundNumber)) || 0
+      });
+    }
     sendState();
     sendClock();
     setImmediate(() => settlePending().catch(console.error));
@@ -1128,6 +1144,10 @@ async function settlePending() {
         // Profile loading and each player's independent wallet credit run
         // concurrently. Each credit is still idempotent per uid/round.
         // Credit wallets first; fetching profile photos must never delay winnings.
+        const winnersTask = buildWinnerDetails(entry).catch(error => {
+          console.warn("WINNER PROFILE RETRY", error.message);
+          return null;
+        });
         const payments = await Promise.all(Object.entries(totals).map(
           async ([uid, amount]) => {
             try {
@@ -1151,7 +1171,7 @@ async function settlePending() {
           .child(key).update({ settled: true, settledAt: Date.now() });
         fullySettled = true;
         // Winner names/photos are display-only and happen after durable credits.
-        preparedWinners = await buildWinnerDetails(entry);
+        preparedWinners = await winnersTask;
       }
 
       const hist = historyArray((await gameRef().child("history").once("value")).val());
