@@ -81,6 +81,42 @@ function db() {
 const gameRef = () => db().ref(GAME_PATH);
 const userRef = uid => db().ref("Users").child(uid);
 
+// Migration phase 1: lightweight read-only wallet shadow. Users/$uid/coins
+// remains the ONLY authority until Android, gifts, top-ups and wallet rules
+// are upgraded together. Never use this snapshot to approve a bet or gift.
+const walletShadowRef = uid => db().ref("wallets").child(uid);
+const shadowSyncJobs = new Map();
+function scheduleWalletShadow(uid) {
+  // One writer per UID. Mark an active job dirty so the latest source value
+  // is re-read after concurrent debits, credits and gifts have completed.
+  if (!validId(uid)) return;
+  const running = shadowSyncJobs.get(uid);
+  if (running) { running.dirty = true; return; }
+  const state = { dirty: true };
+  shadowSyncJobs.set(uid, state);
+  (async () => {
+    try {
+      do {
+        state.dirty = false;
+        const snap = await userRef(uid).child("coins").once("value");
+        const coins = Number(snap.val());
+        if (!snap.exists() || !validCoins(coins)) return;
+        await walletShadowRef(uid).update({
+          coins,
+          source: "Users/coins",
+          role: "shadow_not_authoritative",
+          lastSyncedAt: admin.database.ServerValue.TIMESTAMP
+        });
+      } while (state.dirty);
+    } catch (error) {
+      console.error("WALLET SHADOW SYNC ERROR:", error.message);
+    } finally {
+      if (shadowSyncJobs.get(uid) === state) shadowSyncJobs.delete(uid);
+    }
+  })();
+}
+
+
 // Verify that the record is visible before starting a parent-node transaction.
 // Firebase RTDB may initially invoke a transaction updater with null while
 // loading its local state. Never interpret that provisional null as proof that
@@ -166,7 +202,14 @@ async function walletTransactionReady(ref, updater) {
     });
     if (write.status === 412) continue;
     if (!write.ok) throw new Error(`WALLET_WRITE_HTTP_${write.status}`);
-    return { committed: true, snapshot: snapshot(await write.json()) };
+    const saved = await write.json();
+    if (before && saved && Number(before.coins) !== Number(saved.coins)) {
+      const uid = decodeURIComponent(base.substring((DB_URL + "/Users/").length).split("/")[0]);
+      // Fire-and-forget; success of an actual wallet transaction NEVER depends
+      // on this non-authoritative data copy.
+      scheduleWalletShadow(uid);
+    }
+    return { committed: true, snapshot: snapshot(saved) };
   }
   throw new Error("WALLET_CONCURRENT_RETRY_EXHAUSTED");
 }
@@ -1900,6 +1943,28 @@ app.get("/api/account/status", async (req, res) => {
     });
   } catch (error) {
     return res.status(401).json({ ok: false, error: error.message });
+  }
+});
+
+// Authenticated shadow migration check: sync on demand for accounts that
+// have never placed a bet, and report whether this copy is ready.
+app.get("/api/wallet/migration-status", async (req, res) => {
+  try {
+    const { uid } = await verifyHttpUser(req);
+    const source = await userRef(uid).child("coins").once("value");
+    if (!source.exists() || !validCoins(Number(source.val()))) {
+      return res.status(404).json({ok:false,error:"INVALID_SOURCE_WALLET"});
+    }
+    const shadow = await walletShadowRef(uid).once("value");
+    const actual = shadow.val();
+    const matched = Number(actual?.coins) === Number(source.val()) &&
+      actual?.role === "shadow_not_authoritative";
+    if (!matched) scheduleWalletShadow(uid);
+    return res.json({ok:true,mode:"shadow_only",source:"Users/coins",
+      mirrorExists:shadow.exists(),mirrorMatches:matched,
+      message:"Balances are not migrated; Users/coins remains authoritative"});
+  } catch (error) {
+    res.status(401).json({ok:false,error:error.message});
   }
 });
 
