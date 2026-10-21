@@ -255,7 +255,7 @@ let settlementProcessing = false;
 const incomingBets = new Map();
 // Keep a small grace period for requests that reached the server before the
 // cutoff; never stall the spin for 20 seconds when a Firebase request hangs.
-const MAX_SETTLE_WAIT_MS = 4000;
+const MAX_SETTLE_WAIT_MS = 12000;
 
 function beginIncoming(round) {
   incomingBets.set(round, (incomingBets.get(round) || 0) + 1);
@@ -734,8 +734,6 @@ async function reserveCoins(
   // Prefetch once to distinguish a genuinely missing record from the
   // Firebase transaction updater's provisional null on an uncached node.
   // The actual debit and available-balance check remain atomic below.
-  const preflight = await walletPreflight(uid);
-  if (!preflight.ok) return preflight;
   let reason = "WALLET_REJECTED";
 
   const tx = await walletTransactionReady(
@@ -1004,9 +1002,10 @@ async function placeBet(data, admission) {
 
     // The wager and wallet debit are now durable. Return the ACK immediately;
     // a third Firebase transaction merely annotates the accepted bet ledger.
-    setBetStatus(uid, betId, "accepted").catch(error => {
-      console.error("BET STATUS ERROR:", error.message);
-    });
+    // Display confirms from the game commit ACK immediately. Status syncing
+    // happens behind later queued bets, avoiding extra wallet CAS collisions.
+    enqueueUserBet(uid, () => setBetStatus(uid, betId, "accepted"))
+      .catch(error => console.error("BET STATUS ERROR:", error.message));
 
     return {
       ok: true,
@@ -1073,11 +1072,6 @@ async function creditWinner(
   const key = String(roundNumber);
 
   // Read the existing wallet once before its atomic payout transaction.
-  const preflight = await walletPreflight(uid);
-  if (!preflight.ok) {
-    console.error("PAYOUT WALLET PREFLIGHT:", preflight.error);
-    return false; // Settlement retries; never mark this payout successful.
-  }
   // Idempotent credit: each uid/round has a single payout marker.
   const tx = await walletTransactionReady(
     userRef(uid),
@@ -1266,8 +1260,6 @@ async function giftReceiverOnSeat(
 async function chargeGift(uid, request) {
   // /api/gifts/send already checked the sender and possible retry. The
   // transaction itself checks the actual balance against concurrent charges.
-  const preflight = await walletPreflight(uid);
-  if (!preflight.ok) return preflight;
   let reason = "PAYMENT_REJECTED";
 
   const tx = await walletTransactionReady(
@@ -1506,6 +1498,20 @@ app.post("/api/gifts/send", async (req, res) => {
   }
 });
 
+// Sequentially commit a player's rapid clicks. No arbitrary click-count limit.
+// Each click remains a separate bet with its own ID and exact amount.
+const userBetTails = new Map();
+function enqueueUserBet(uid, work) {
+  const previous = userBetTails.get(uid) || Promise.resolve();
+  const pending = previous.catch(() => {}).then(work);
+  const tail = pending.catch(() => {});
+  userBetTails.set(uid, tail);
+  tail.finally(() => {
+    if (userBetTails.get(uid) === tail) userBetTails.delete(uid);
+  });
+  return pending;
+}
+
 // ==================================================
 // VOICE + SOCKET
 // ==================================================
@@ -1628,11 +1634,15 @@ io.on("connection", socket => {
       }
       beginIncoming(admission.round);
       try {
-        const result = await placeBet(data, admission);
+        // Firebase wallet reads/writes for the same account must not race.
+        // Validate account identity before queuing. The original reception time
+        // was already captured in admissionFor().
+        const decoded = await verifyToken(String(data?.idToken || ""));
+        const result = await enqueueUserBet(decoded.uid, () => placeBet(data, admission));
         reply(result);
       } catch (error) {
         console.error("SOCKET BET ERROR:", error.message);
-        reply(errorResult("BET_STATUS_UNCERTAIN"));
+        reply(errorResult(error.message === "INVALID_TOKEN" ? "INVALID_TOKEN" : "BET_STATUS_UNCERTAIN"));
       } finally {
         endIncoming(admission.round);
       }
