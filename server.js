@@ -97,12 +97,12 @@ function scheduleWalletShadow(uid) {
     shadowSyncJobs.delete(uid);
     try {
       const snap = await userRef(uid).child("coins").once("value");
-      const coins = Number(snap.val());
-      if (!snap.exists() || !validCoins(coins)) return;
+      const coins = exactCoins(snap.val());
+      if (!snap.exists() || coins === null) return;
       // A newer mutation while this read was running schedules another sync.
       // Only the final sync is intended as the mirror; it never authorizes wagers.
       await walletShadowRef(uid).update({
-        coins, source: "Users/coins", role: "shadow_not_authoritative",
+        coins: storedCoins(coins), source: "Users/coins", role: "shadow_not_authoritative",
         lastSyncedAt: admin.database.ServerValue.TIMESTAMP
       });
     } catch (error) {
@@ -128,7 +128,7 @@ async function walletPreflight(uid) {
   }
   const user = snapshot.val();
   if (!user || typeof user !== "object" ||
-      !validCoins(Number(user.coins))) {
+      exactCoins(user.coins) === null) {
     return errorResult("INVALID_WALLET");
   }
   return { ok: true };
@@ -147,6 +147,32 @@ function validRequestId(value) {
 
 function validCoins(value) {
   return Number.isSafeInteger(value) && value >= 0;
+}
+
+// Exact integer balances: existing safe JSON numbers remain compatible;
+// larger values are persisted as decimal strings, never floating-point numbers.
+// Maximum requested payout: 9,999,999,999 billion coins.
+const MAX_PAYOUT = 9999999999000000000000n;
+const MAX_ACCOUNT_COINS = 10n ** 40n; // headroom for subsequent rewards; bounded for RTDB safety
+function exactCoins(value) {
+  if (typeof value === "bigint") return value >= 0n && value <= MAX_ACCOUNT_COINS ? value : null;
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
+  }
+  if (typeof value === "string" && /^(0|[1-9][0-9]{0,40})$/.test(value)) {
+    const v = BigInt(value);
+    return v <= MAX_ACCOUNT_COINS ? v : null;
+  }
+  return null;
+}
+function storedCoins(value) {
+  if (value < 0n || value > MAX_ACCOUNT_COINS) throw Error("COIN_LIMIT");
+  return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value.toString();
+}
+function exactSum(a, b) {
+  const x = exactCoins(a), y = exactCoins(b);
+  if (x === null || y === null || x + y > MAX_ACCOUNT_COINS) return null;
+  return x + y;
 }
 
 function errorResult(error) {
@@ -197,7 +223,7 @@ async function walletTransactionReady(ref, updater) {
     if (write.status === 412) continue;
     if (!write.ok) throw new Error(`WALLET_WRITE_HTTP_${write.status}`);
     const saved = await write.json();
-    if (before && saved && Number(before.coins) !== Number(saved.coins)) {
+    if (before && saved && String(before.coins) !== String(saved.coins)) {
       const uid = decodeURIComponent(base.substring((DB_URL + "/Users/").length).split("/")[0]);
       // Fire-and-forget; success of an actual wallet transaction NEVER depends
       // on this non-authoritative data copy.
@@ -269,13 +295,13 @@ async function readWallet(uid, operation) {
     return errorResult("INVALID_USER");
   }
 
-  const coins = Number(user.coins);
+  const coins = exactCoins(user.coins);
 
-  if (!validCoins(coins)) {
+  if (coins === null) {
     return errorResult("INVALID_WALLET");
   }
 
-  return { ok: true, uid, coins, user };
+  return { ok: true, uid, coins: storedCoins(coins), user };
 }
 
 // ==================================================
@@ -492,39 +518,22 @@ function profilePhoto(user) {
 function calculatePayouts(entry) {
   const totals = {};
   const winner = Number(entry.winningIndex);
-
   for (const bet of Object.values(entry.bets || {})) {
-    const uid = bet.uid;
-    const index = Number(bet.foodIndex);
-    const amount = Number(bet.amount);
-
-    if (
-      !validId(uid) ||
-      index !== winner ||
-      !validCoins(amount) ||
-      amount === 0
-    ) {
-      continue;
-    }
-
-    const payout = amount * MULTIPLIERS[index];
-
-    if (!validCoins(payout)) continue;
-
-    const next = (totals[uid] || 0) + payout;
-
-    if (!validCoins(next)) continue;
-
-    totals[uid] = next;
+    if (!validId(bet.uid) || Number(bet.foodIndex) !== winner) continue;
+    const stake = exactCoins(bet.amount);
+    if (stake === null || stake === 0n) continue;
+    const value = stake * BigInt(MULTIPLIERS[winner]);
+    const total = (totals[bet.uid] || 0n) + value;
+    if (total > MAX_ACCOUNT_COINS) continue;
+    totals[bet.uid] = total;
   }
-
-  return totals;
+  return Object.fromEntries(Object.entries(totals).map(([uid, amount]) => [uid, storedCoins(amount)]));
 }
 
 async function buildWinnerDetails(entry) {
   const totals = calculatePayouts(entry);
   const ordered = Object.entries(totals)
-    .sort((a, b) => b[1] - a[1]);
+    .sort((a, b) => { const x = exactCoins(a[1]) || 0n, y = exactCoins(b[1]) || 0n; return y > x ? 1 : y < x ? -1 : 0; });
 
   const winners = await Promise.all(
     ordered.map(async ([uid, amount], position) => {
@@ -814,21 +823,21 @@ async function reserveCoins(
         return;
       }
 
-      const coins = Number(user.coins);
+      const coins = exactCoins(user.coins);
 
-      if (!validCoins(coins)) {
+      if (coins === null) {
         reason = "INVALID_WALLET";
         return;
       }
 
-      if (coins < amount) {
+      if (coins < BigInt(amount)) {
         reason = "INSUFFICIENT_COINS";
         return;
       }
 
       return {
         ...user,
-        coins: coins - amount,
+        coins: storedCoins(coins - BigInt(amount)),
         lionBets: {
           ...bets,
           [betId]: {
@@ -848,7 +857,7 @@ async function reserveCoins(
 
   return {
     ok: true,
-    balance: Number(tx.snapshot.val()?.coins)
+    balance: tx.snapshot.val()?.coins
   };
 }
 
@@ -894,17 +903,17 @@ async function refundBet(uid, betId) {
       if (bet.status !== "reserved") return;
 
       const amount = Number(bet.amount);
-      const coins = Number(user.coins);
+      const coins = exactCoins(user.coins);
 
       if (
         !validCoins(amount) ||
-        !validCoins(coins) ||
-        !Number.isSafeInteger(coins + amount)
+        coins === null ||
+        coins + BigInt(amount) > MAX_ACCOUNT_COINS
       ) return;
 
       return {
         ...user,
-        coins: coins + amount,
+        coins: storedCoins(coins + BigInt(amount)),
         lionBets: {
           ...user.lionBets,
           [betId]: {
@@ -1133,41 +1142,41 @@ async function placeBet(data, admission) {
 async function creditWinningBets(uid, roundNumber, winningBets) {
   if (!winningBets.length) return { ok: true, credited: 0 };
   const key = String(roundNumber);
-  let newlyCredited = 0;
+  let newlyCredited = 0n;
   const tx = await walletTransactionReady(userRef(uid), user => {
-    newlyCredited = 0;
+    newlyCredited = 0n;
     if (!user) return;
     const payouts = user.lionPayouts || {};
     const previous = payouts[key];
     const markers = user.lionPaidBetIds || {};
-    // Migration safety: the old implementation paid the whole round at once.
-    if (previous && !previous.betIds) return;
+    if (previous && !previous.betIds) return; // pre-migration round was already paid
     const already = { ...(previous?.betIds || {}) };
     for (const bet of winningBets) {
       const id = String(bet.betId);
       if (already[id] || markers[id]) continue;
-      const value = Number(bet.amount) * MULTIPLIERS[Number(bet.foodIndex)];
-      if (!validCoins(value) || value === 0 ||
-          !Number.isSafeInteger(newlyCredited + value)) return;
+      const stake = exactCoins(bet.amount);
+      const multiplier = MULTIPLIERS[Number(bet.foodIndex)];
+      if (stake === null || !Number.isInteger(multiplier)) return;
+      const value = stake * BigInt(multiplier);
+      if (value === 0n || newlyCredited + value > MAX_PAYOUT) return;
       newlyCredited += value;
       already[id] = true;
     }
-    if (!newlyCredited) return;
-    const coins = Number(user.coins);
-    const oldAmount = Number(previous?.amount || 0);
-    if (!validCoins(coins) || !validCoins(oldAmount) ||
-        !Number.isSafeInteger(coins + newlyCredited) ||
-        !Number.isSafeInteger(oldAmount + newlyCredited)) return;
+    if (newlyCredited === 0n) return;
+    const coins = exactCoins(user.coins);
+    const oldAmount = exactCoins(previous?.amount ?? 0);
+    if (coins === null || oldAmount === null ||
+        coins + newlyCredited > MAX_ACCOUNT_COINS || oldAmount + newlyCredited > MAX_ACCOUNT_COINS) return;
     return {
       ...user,
-      coins: coins + newlyCredited,
+      coins: storedCoins(coins + newlyCredited),
       lionPayouts: {
         ...payouts,
-        [key]: { amount: oldAmount + newlyCredited, completedAt: Date.now(), betIds: already }
+        [key]: { amount: storedCoins(oldAmount + newlyCredited), completedAt: Date.now(), betIds: already }
       }
     };
   });
-  if (tx.committed) return { ok: true, credited: newlyCredited };
+  if (tx.committed) return { ok: true, credited: storedCoins(newlyCredited) };
   const prior = tx.snapshot.val()?.lionPayouts?.[key];
   if (prior && !prior.betIds) return { ok: true, credited: 0 };
   if (winningBets.every(bet => prior?.betIds?.[String(bet.betId)]))
@@ -1223,7 +1232,7 @@ async function settlePending() {
       }));
       for (const payment of payments) {
         if (!payment.ok) allPaid = false;
-        if (payment.credited > 0) changes[payment.uid] = payment.credited;
+        if ((exactCoins(payment.credited) || 0n) > 0n) changes[payment.uid] = payment.credited;
       }
       if (Object.keys(changes).length) {
         io.to(GAME_ROOM).emit("greedy_lion_payouts_credited", {
@@ -1325,21 +1334,21 @@ async function chargeGift(uid, request) {
         return;
       }
 
-      const coins = Number(user.coins);
+      const coins = exactCoins(user.coins);
 
-      if (!validCoins(coins)) {
+      if (coins === null) {
         reason = "INVALID_WALLET";
         return;
       }
 
-      if (coins < request.amount) {
+      if (coins < BigInt(request.amount)) {
         reason = "INSUFFICIENT_COINS";
         return;
       }
 
       return {
         ...user,
-        coins: coins - request.amount,
+        coins: storedCoins(coins - BigInt(request.amount)),
         giftPayments: {
           ...payments,
           [request.requestId]: {
@@ -1367,7 +1376,7 @@ async function chargeGift(uid, request) {
   return {
     ok: true,
     newlyCharged: tx.committed,
-    balance: Number(saved.coins),
+    balance: saved.coins,
     senderId: String(saved.customId || ""),
     senderName: profileName(saved),
     createdAt: payment.createdAt
@@ -1571,7 +1580,7 @@ function scheduleAcceptedStatuses(_uid, _ids) {
 // A single durable wallet/game commit can cover many rapid clicks; each caller
 // receives its own ACK only after that commit. Never merge across rounds.
 const waitingBatchGroups = new Map();
-const SERVER_BATCH_MS = 140; // Fewer full-user CAS writes during rapid taps
+const SERVER_BATCH_MS = 50; // Coalesce rapid taps while avoiding avoidable ACK delay
 const MAX_SERVER_BATCH_BETS = 200;
 function collectBetBatch(uid, items, admission) {
   return new Promise(resolve => {
@@ -1592,7 +1601,7 @@ function collectBetBatch(uid, items, admission) {
     group.count += items.length;
     group.receivedAt = Math.min(group.receivedAt, admission.receivedAt);
     if (group.count >= MAX_SERVER_BATCH_BETS ||
-        Date.now() >= Number(game?.roundEndsAt || 0) - 90) flushBetGroup(key);
+        Date.now() >= Number(game?.roundEndsAt || 0) - 600) flushBetGroup(key);
   });
 }
 function flushBetGroup(key) {
@@ -1655,15 +1664,15 @@ async function placeBetBatch(uid, requests, admission) {
     if (!user) { reason = "USER_NOT_FOUND"; return; }
     const prior = user.lionBets || {};
     if (items.some(x => prior[x.betId])) { reason = "DUPLICATE_BET"; return; }
-    const coins = Number(user.coins);
-    if (!validCoins(coins)) { reason = "INVALID_WALLET"; return; }
-    if (coins < sum) { reason = "INSUFFICIENT_COINS"; return; }
+    const coins = exactCoins(user.coins);
+    if (coins === null) { reason = "INVALID_WALLET"; return; }
+    if (coins < BigInt(sum)) { reason = "INSUFFICIENT_COINS"; return; }
     const additions = {};
     for (const item of items) additions[item.betId] = {
       amount: item.amount, roundNumber: round, foodIndex: item.foodIndex,
       status: "reserved", createdAt: Date.now()
     };
-    return { ...user, coins: coins - sum, lionBets: { ...prior, ...additions } };
+    return { ...user, coins: storedCoins(coins - BigInt(sum)), lionBets: { ...prior, ...additions } };
   });
   if (!reservation.committed) return errorResult(reason);
   const refundAll = async () => {
@@ -1677,9 +1686,9 @@ async function placeBetBatch(uid, requests, admission) {
         bets[item.betId] = { ...bets[item.betId], status: "refunded", refundedAt: Date.now() };
       }
       if (!refund) return;
-      const coins = Number(user.coins);
-      if (!validCoins(coins) || !Number.isSafeInteger(coins + refund)) return;
-      return { ...user, coins: coins + refund, lionBets: bets };
+      const coins = exactCoins(user.coins);
+      if (coins === null || coins + BigInt(refund) > MAX_ACCOUNT_COINS) return;
+      return { ...user, coins: storedCoins(coins + BigInt(refund)), lionBets: bets };
     });
     return tx.committed || items.every(x => tx.snapshot.val()?.lionBets?.[x.betId]?.status === "refunded");
   };
@@ -1721,7 +1730,7 @@ async function placeBetBatch(uid, requests, admission) {
     game = tx.snapshot.val();
     // Confirmation follows durable wallet debit + game entry, not this optional status mirror.
     scheduleAcceptedStatuses(uid, items.map(x => x.betId));
-    return { ok: true, roundNumber: round, betIds: items.map(x => x.betId), balance: Number(reservation.snapshot.val()?.coins) };
+    return { ok: true, roundNumber: round, betIds: items.map(x => x.betId), balance: reservation.snapshot.val()?.coins };
   } catch (error) {
     console.error("BATCH COMMIT ERROR", error.message);
     // An uncertain game transaction must be checked before any refund.
@@ -1965,7 +1974,7 @@ app.get("/api/account/status", async (req, res) => {
     return res.json({
       ok: true, authenticatedUid: decoded.uid,
       publicId: String(data.customId || data.userId || ""),
-      walletValid: validCoins(Number(data.coins)),
+      walletValid: exactCoins(data.coins) !== null,
       accountFound: true
     });
   } catch (error) {
@@ -1979,12 +1988,12 @@ app.get("/api/wallet/migration-status", async (req, res) => {
   try {
     const { uid } = await verifyHttpUser(req);
     const source = await userRef(uid).child("coins").once("value");
-    if (!source.exists() || !validCoins(Number(source.val()))) {
+    if (!source.exists() || exactCoins(source.val()) === null) {
       return res.status(404).json({ok:false,error:"INVALID_SOURCE_WALLET"});
     }
     const shadow = await walletShadowRef(uid).once("value");
     const actual = shadow.val();
-    const matched = Number(actual?.coins) === Number(source.val()) &&
+    const matched = String(actual?.coins) === String(source.val()) &&
       actual?.role === "shadow_not_authoritative";
     if (!matched) scheduleWalletShadow(uid);
     return res.json({ok:true,mode:"shadow_only",source:"Users/coins",
