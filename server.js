@@ -336,12 +336,16 @@ async function walletV2Cas(uid, updater) {
   throw Error('V2_CONCURRENT_RETRY_EXHAUSTED');
 }
 const initializingV2 = new Map();
+// Cache only successfully verified wallet existence within this server process.
+const readyV2Wallets = new Set();
 async function ensureV2(uid) {
   if (!validId(uid)) throw Error('INVALID_UID');
   const store = walletV2();
+  if (readyV2Wallets.has(uid)) return store;
   const existing = await store.refFor(uid).child('balance').once('value');
   if (existing.exists()) {
     v2Amount(existing.val());
+    readyV2Wallets.add(uid);
     return store;
   }
   if (initializingV2.has(uid)) return initializingV2.get(uid);
@@ -363,6 +367,7 @@ async function ensureV2(uid) {
     });
     if (!result.wallet || typeof result.wallet.balance !== 'string') throw Error('V2_INIT_FAILED');
     console.log('WALLET_V2_ACTIVE', {uidSuffix:uid.slice(-5),initialized:result.committed});
+    readyV2Wallets.add(uid);
     return store;
   })();
   initializingV2.set(uid, job);
@@ -1643,7 +1648,7 @@ function scheduleAcceptedStatuses(_uid, _ids) {
 // A single durable wallet/game commit can cover many rapid clicks; each caller
 // receives its own ACK only after that commit. Never merge across rounds.
 const waitingBatchGroups = new Map();
-const SERVER_BATCH_MS = 50; // Coalesce rapid taps while avoiding avoidable ACK delay
+const SERVER_BATCH_MS = 170; // Save one larger durable debit per burst instead of many tiny debits
 const MAX_SERVER_BATCH_BETS = 200;
 function collectBetBatch(uid, items, admission) {
   return new Promise(resolve => {
