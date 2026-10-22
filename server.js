@@ -309,6 +309,22 @@ async function readWallet(uid, operation) {
 const { createWalletStore } = require('./maxchat_wallet_migration/firebase-wallet-adapter');
 const { amount: v2Amount, createWallet: v2Create, debit: v2Debit, credit: v2Credit } = require('./maxchat_wallet_migration/compact-wallet');
 const walletV2 = () => createWalletStore(db());
+// RTDB may contain numeric legacy balances. Normalize only safe whole numbers;
+// preserve all debit/credit markers and never derive money from Users/coins.
+function validV2Balance(value) {
+  if (typeof value === 'string') {
+    try { v2Amount(value); return value; } catch (_) { return null; }
+  }
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
+    return String(value);
+  }
+  return null;
+}
+function normalizeExistingV2(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return null;
+  const balance = validV2Balance(record.balance);
+  return balance === null ? null : { ...record, balance };
+} 
 // Firebase REST ETag CAS reads only the compact wallet, never the huge Users tree.
 // Unlike an SDK transaction, its updater receives a persisted snapshot, not a provisional null.
 async function walletV2Cas(uid, updater) {
@@ -327,20 +343,20 @@ async function walletV2Cas(uid, updater) {
     const etag = get.headers.get('etag');
     if (!etag) throw Error('V2_ETAG_MISSING');
     const before = await get.json();
-    if (!before || typeof before.balance !== 'string') {
+    if (!normalizeExistingV2(before)) {
       const source = await walletV2().refFor(uid).once('value');
       const actual = source.val();
       const diagnostics = { uidSuffix: uid.slice(-5), attempt: attempt + 1,
         restHasRecord: !!before, adminHasRecord: source.exists(),
-        adminHasBalance: typeof actual?.balance === 'string' };
+        adminBalanceType: typeof actual?.balance, adminBalanceValid: !!normalizeExistingV2(actual) };
       console.error('V2_WALLET_READ_MISMATCH', diagnostics);
-      if (actual && typeof actual.balance === 'string') {
+      if (normalizeExistingV2(actual)) {
         // Never write stale or null data. Retry, then return a clear error.
         continue;
       }
       throw Error(source.exists() ? 'WALLET_V2_SCHEMA_INVALID' : 'WALLET_V2_UID_RECORD_MISSING');
     }
-    const after = updater(before);
+    const after = updater(normalizeExistingV2(before));
     if (after === undefined) return { committed:false, wallet:before };
     if (!after || typeof after.balance !== 'string') throw Error('INVALID_V2_UPDATE');
     const put = await fetch(url, { method:'PUT',
@@ -363,12 +379,12 @@ async function ensureV2(uid) {
   const existing = existingWallet.val();
   if (existingWallet.exists()) {
     // An existing record must never be silently re-created from stale Users/coins.
-    if (!existing || typeof existing.balance !== 'string') {
+    if (!normalizeExistingV2(existing)) {
       console.error('V2_WALLET_SCHEMA_INVALID', { uidSuffix: uid.slice(-5), hasRecord: true,
-        fields: existing && typeof existing === 'object' ? Object.keys(existing).slice(0, 12) : [] });
+        balanceType: typeof existing?.balance, fields: existing && typeof existing === 'object' ? Object.keys(existing).slice(0, 12) : [] });
       throw Error('WALLET_V2_SCHEMA_INVALID');
     }
-    v2Amount(existing.balance);
+    v2Amount(validV2Balance(existing.balance));
     verifiedV2At.set(uid, Date.now());
     return store;
   }
@@ -402,7 +418,7 @@ async function v2Batch(uid, kind, entries) {
   if (!entries.length) throw Error('EMPTY_WALLET_BATCH');
   await ensureV2(uid);
   const tx = await walletV2Cas(uid, old => {
-    if (!old || typeof old.balance !== 'string') throw Error('WALLET_V2_SCHEMA_INVALID');
+    if (!normalizeExistingV2(old)) throw Error('WALLET_V2_SCHEMA_INVALID');
     let next=old, changed=false;
     const ops=kind === 'debit' ? old.debits||{} : old.credits||{};
     const already=entries.filter(x=>ops[x.id]!==undefined);
@@ -439,10 +455,10 @@ app.get('/api/wallet-v2/check', async (req, res) => {
   try {
     const record = await walletV2().refFor(uid).once('value');
     const data = record.val();
-    const hasBalance = typeof data?.balance === 'string';
+    const hasBalance = !!normalizeExistingV2(data);
     return res.json({ ok: hasBalance, build:'2026-10-22-v2-readable-1',
       walletRecordExists: record.exists(), walletBalanceValid:hasBalance,
-      walletOperationHistory: !!(data?.debits || data?.credits),
+      walletOperationHistory: !!(data?.debits || data?.credits), balanceType: typeof data?.balance,
       error: hasBalance ? null : (record.exists() ? 'WALLET_V2_SCHEMA_INVALID' : 'WALLET_V2_UID_RECORD_MISSING') });
   } catch (error) {
     console.error('V2_CHECK_FAILED', { uidSuffix:uid.slice(-5), error:error.message });
@@ -1478,7 +1494,7 @@ async function chargeGift(uid,request) {
   const id=`gift_${request.requestId.replace(/-/g,'_')}`;
   const signature=[request.roomId,request.giftId,request.receiverId,request.quantity,request.amount].join(':');
   const tx=await walletV2Cas(uid, old=>{
-    if (!old || typeof old.balance !== 'string') throw Error('WALLET_V2_NOT_AVAILABLE');
+    if (!normalizeExistingV2(old)) throw Error('WALLET_V2_NOT_AVAILABLE');
     const previous=old.giftSignatures?.[id];
     if(previous && previous!==signature) throw Error('REQUEST_ID_CONFLICT');
     if(previous) return;
@@ -2115,9 +2131,9 @@ app.get('/api/wallet-v2/readiness', async (req, res) => {
     const newSnap = await store.refFor(uid).once('value');
     const newWallet = newSnap.val();
     let v2Valid = false, v2MatchesSource = false;
-    if (newWallet && typeof newWallet.balance === 'string') {
+    if (normalizeExistingV2(newWallet)) {
       try {
-        const coins = parseWalletV2Amount(newWallet.balance);
+        const coins = parseWalletV2Amount(validV2Balance(newWallet.balance));
         v2Valid = true;
         v2MatchesSource = coins === sourceCoins;
       } catch (_) {}
@@ -2173,7 +2189,7 @@ app.get("/", (req, res) => {
 // ==================================================
 
 httpServer.listen(PORT, async () => {
-  console.log('MAXCHAT_WALLET_DIAGNOSTIC_BUILD', '2026-10-22-v2-readable-1');
+  console.log('MAXCHAT_WALLET_FORMAT_FIX', '2026-10-22-numeric-balance-1');
   console.log("MAX CHAT SERVER RUNNING:", PORT);
   console.log("BETTING ENABLED:", BETTING_ENABLED);
   console.log("GIFTS ENABLED:", GIFTS_ENABLED);
