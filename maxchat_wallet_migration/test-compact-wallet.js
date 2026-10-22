@@ -1,0 +1,17 @@
+'use strict'; const assert=require('node:assert/strict');
+const {amount,createWallet,debit,credit,payoutForBets}=require('./compact-wallet');
+const id='bet_0123456789abcdef0123456789';
+let w=createWallet('100000000000000000000000000');
+const r=debit(w,id,'1000000'); w=r.wallet;
+assert.equal(debit(w,id,'1000000').wallet.balance,w.balance);
+assert.equal(debit(w,id,'1000000').repeated,true);
+const p=payoutForBets(Array.from({length:5},()=>({foodIndex:0,amount:'1000000'})),0,'45');
+assert.equal(p,'225000000');
+w=credit(w,'payout_0123456789abcdef012345',p).wallet;
+assert.equal(credit(w,'payout_0123456789abcdef012345',p).repeated,true);
+assert.equal(w.balance, '100000000000000000224000000');
+assert.throws(()=>debit(createWallet('100'),id,'101'),/INSUFFICIENT/);
+assert.throws(()=>amount(999999999999999999),/UNSAFE_AMOUNT/);
+const large=payoutForBets([{foodIndex:0,amount:'9999999999000000000000'}],0,'45');
+assert.equal(large, '449999999955000000000000');
+console.log('PASS: exact big amounts, repeated debit/payout, insufficient balance, payout aggregation');
