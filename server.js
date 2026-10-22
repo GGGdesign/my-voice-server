@@ -1707,7 +1707,11 @@ function scheduleAcceptedStatuses(_uid, _ids) {
 // A single durable wallet/game commit can cover many rapid clicks; each caller
 // receives its own ACK only after that commit. Never merge across rounds.
 const waitingBatchGroups = new Map();
-const SERVER_BATCH_MS = 50; // Coalesce rapid taps while avoiding avoidable ACK delay
+// Collect a burst of taps into ONE atomic wallet debit, including totals above
+// 100,000,000 coins. No speculative wallet edits: all ACKs follow the real CAS.
+// Quiet-time debounce, bounded by max wait so continuous tapping never stalls.
+const SERVER_BATCH_QUIET_MS = 350;
+const SERVER_BATCH_MAX_WAIT_MS = 1000;
 const MAX_SERVER_BATCH_BETS = 200;
 function collectBetBatch(uid, items, admission) {
   return new Promise(resolve => {
@@ -1717,18 +1721,27 @@ function collectBetBatch(uid, items, admission) {
       flushBetGroup(key);
       group = null;
     }
+    const now = Date.now();
     if (!group) {
       group = { uid, round: admission.round, receivedAt: admission.receivedAt,
-        items: [], calls: [], count: 0, timer: null };
+        startedAt: now, items: [], calls: [], count: 0, timer: null };
       waitingBatchGroups.set(key, group);
-      group.timer = setTimeout(() => flushBetGroup(key), SERVER_BATCH_MS);
     }
     group.items.push(...items);
     group.calls.push({ resolve, betIds: items.map(x => String(x.betId)) });
     group.count += items.length;
     group.receivedAt = Math.min(group.receivedAt, admission.receivedAt);
-    if (group.count >= MAX_SERVER_BATCH_BETS ||
-        Date.now() >= Number(game?.roundEndsAt || 0) - 600) flushBetGroup(key);
+    const deadline = Number(game?.roundEndsAt || 0);
+    if (group.count >= MAX_SERVER_BATCH_BETS || (deadline && now >= deadline - 350)) {
+      flushBetGroup(key);
+      return;
+    }
+    // Re-arm on every press, but never exceed the hard time cap or round end.
+    const untilCap = Math.max(0, SERVER_BATCH_MAX_WAIT_MS - (now - group.startedAt));
+    const untilRound = deadline ? Math.max(0, deadline - now - 100) : SERVER_BATCH_QUIET_MS;
+    const delay = Math.min(SERVER_BATCH_QUIET_MS, untilCap, untilRound);
+    clearTimeout(group.timer);
+    group.timer = setTimeout(() => flushBetGroup(key), delay);
   });
 }
 function flushBetGroup(key) {
