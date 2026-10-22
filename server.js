@@ -2005,6 +2005,48 @@ app.get("/api/wallet/migration-status", async (req, res) => {
 });
 
 // ==================================================
+// WALLET V2 READINESS (READ ONLY)
+// No migration, minting, debiting, or crediting happens in this endpoint.
+// Only the Firebase-authenticated user can inspect their own readiness.
+// ==================================================
+const { createWalletStore } = require('./maxchat_wallet_migration/firebase-wallet-adapter');
+const { amount: parseWalletV2Amount } = require('./maxchat_wallet_migration/compact-wallet');
+
+app.get('/api/wallet-v2/readiness', async (req, res) => {
+  let uid;
+  try { uid = (await verifyHttpUser(req)).uid; }
+  catch (_) { return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' }); }
+  try {
+    const sourceSnap = await userRef(uid).child('coins').once('value');
+    const sourceCoins = exactCoins(sourceSnap.val());
+    if (!sourceSnap.exists() || sourceCoins === null) {
+      return res.status(409).json({ok:false,error:'INVALID_SOURCE_BALANCE'});
+    }
+    const store = createWalletStore(db());
+    const newSnap = await store.refFor(uid).once('value');
+    const newWallet = newSnap.val();
+    let v2Valid = false, v2MatchesSource = false;
+    if (newWallet && typeof newWallet.balance === 'string') {
+      try {
+        const coins = parseWalletV2Amount(newWallet.balance);
+        v2Valid = true;
+        v2MatchesSource = coins === sourceCoins;
+      } catch (_) {}
+    }
+    return res.json({
+      ok: true, mode: 'READ_ONLY_NOT_MIGRATED',
+      source: 'Users/{uid}/coins', target: 'walletV2/{uid}/balance',
+      targetExists: newSnap.exists(), targetValid: v2Valid,
+      currentlySameAmount: v2MatchesSource,
+      warning: 'The server still uses Users/coins for all real bets, payouts and gifts. No migration was performed.'
+    });
+  } catch (error) {
+    console.error('WALLET V2 READINESS ERROR:', error.message);
+    return res.status(503).json({ok:false,error:'WALLET_READINESS_UNAVAILABLE'});
+  }
+});
+
+// ==================================================
 // HEALTH
 // ==================================================
 
