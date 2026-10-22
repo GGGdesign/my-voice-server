@@ -1111,8 +1111,9 @@ async function placeBet(data, admission) {
 // PAYOUTS
 // ==================================================
 
-// Credit individual winning bets as soon as they are durably registered.
-// Each bet id is a durable idempotency key within the SAME atomic wallet CAS.
+// Credit the SUM of a player's winning bets in ONE atomic wallet CAS per round.
+// Wait for the round's admitted bets to finish first (see settlePending).
+// Individual bet IDs remain durable idempotency markers for retry/recovery.
 // Older round-level payouts without bet markers are treated as already paid.
 async function creditWinningBets(uid, roundNumber, winningBets) {
   if (!winningBets.length) return { ok: true, credited: 0 };
@@ -1169,10 +1170,19 @@ async function settlePending() {
       if (!entry || ![1, 2].includes(entry.payoutVersion)) continue;
       const round = Number(entry.roundNumber);
       const winnerIndex = Number(entry.winningIndex);
-      // Incoming requests may still commit, but they never block payouts for
-      // winning bets which have already been committed into this ledger.
+      // Pay exactly ONCE per player/round, after all pre-deadline requests
+      // have finished persisting. Paying while the ledger is still growing
+      // results in multiple wallet credits for repeated clicks on one slot.
+      const stillIncoming = (incomingBets.get(round) || 0) > 0 ||
+        [...waitingBatchGroups.keys()].some(k => k.endsWith(`:${round}`));
+      if (stillIncoming) continue;
+      // Refresh the round ledger after the admission barrier, rather than
+      // using an earlier snapshot that might omit the last committed batch.
+      const latestEntrySnap = await gameRef().child("pendingSettlement").child(key).once("value");
+      const completeEntry = latestEntrySnap.val();
+      if (!completeEntry || completeEntry.settled === true) continue;
       const grouped = new Map();
-      for (const [ledgerId, bet] of Object.entries(entry.bets || {})) {
+      for (const [ledgerId, bet] of Object.entries(completeEntry.bets || {})) {
         if (Number(bet.foodIndex) !== winnerIndex || !validId(bet.uid)) continue;
         const amount = Number(bet.amount);
         if (!validCoins(amount) || amount <= 0) continue;
@@ -1201,11 +1211,9 @@ async function settlePending() {
           roundNumber: round, creditedAt: Date.now(), payouts: changes
         });
       }
-      // Do not finalize TOP/history until every pre-deadline request has
-      // reached a durable success/failure; additional winning bets can arrive.
-      const stillIncoming = (incomingBets.get(round) || 0) > 0 ||
-        [...waitingBatchGroups.keys()].some(k => k.endsWith(`:${round}`));
-      if (stillIncoming || !allPaid) continue;
+      // All incoming bets were drained BEFORE crediting. Failed payments
+      // stay pending and retry with the per-bet idempotency markers.
+      if (!allPaid) continue;
       if (entry.settled !== true) {
         await gameRef().child("pendingSettlement").child(key).update({
           settled: true, settledAt: Date.now()
@@ -1215,7 +1223,7 @@ async function settlePending() {
       const published = hist.some(item =>
         Number(item.roundNumber) === round && item.hasSettledBets === true);
       if (!published) {
-        try { await publishRoundWinners(entry); }
+        try { await publishRoundWinners(completeEntry); }
         catch (error) { console.error("WINNER DISPLAY ERROR", error.message); }
       }
       const latest = historyArray((await gameRef().child("history").once("value")).val());
