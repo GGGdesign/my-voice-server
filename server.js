@@ -165,7 +165,6 @@ async function transactionReady(ref, updater) {
 // provisional null). If a concurrent update wins, HTTP 412 makes us retry.
 // This never creates a missing wallet and never updates another user's path.
 async function walletTransactionReady(ref, updater) {
-  const walletOpStarted = Date.now();
   const base = String(ref.toString());
   if (!base.startsWith(DB_URL + "/Users/")) {
     throw new Error("INVALID_WALLET_PATH");
@@ -204,8 +203,6 @@ async function walletTransactionReady(ref, updater) {
       // on this non-authoritative data copy.
       scheduleWalletShadow(uid);
     }
-    const elapsedMs = Date.now() - walletOpStarted;
-    if (elapsedMs > 1500) console.warn("SLOW_WALLET_CAS", { elapsedMs, attempts: attempt + 1 });
     return { committed: true, snapshot: snapshot(saved) };
   }
   throw new Error("WALLET_CONCURRENT_RETRY_EXHAUSTED");
@@ -1504,12 +1501,10 @@ app.post("/api/gifts/send", async (req, res) => {
     // Authentication, exact amount, balance and idempotency are enforced
     // atomically by chargeGift() below. Recipient is chosen by sender.
 
-    // Serialize gifts with the same user's wagers and credited winnings.
-    // No read-only or optimistic wallet may be spent twice.
-    const payment = await enqueueUserBet(uid, () => chargeGift(
+    const payment = await chargeGift(
       uid,
       request
-    ));
+    );
 
     if (!payment.ok) {
       return giftError(
@@ -1562,42 +1557,21 @@ function enqueueUserBet(uid, work) {
   return pending;
 }
 
-// Bookkeeping must not compete with actual wallet debits on every tap.
-// Batch status changes after a short quiet period, preserving the durable bet IDs.
-const pendingStatusByUser = new Map();
-function scheduleAcceptedStatuses(uid, ids) {
-  if (!Array.isArray(ids) || !ids.length) return;
-  let job = pendingStatusByUser.get(uid);
-  if (!job) {
-    job = { ids: new Set(), timer: null };
-    pendingStatusByUser.set(uid, job);
-  }
-  for (const id of ids) job.ids.add(id);
-  clearTimeout(job.timer);
-  job.timer = setTimeout(() => {
-    if (pendingStatusByUser.get(uid) !== job) return;
-    pendingStatusByUser.delete(uid);
-    const betIds = [...job.ids];
-    walletTransactionReady(userRef(uid), user => {
-      if (!user) return;
-      const bets = { ...(user.lionBets || {}) };
-      let changed = false;
-      for (const id of betIds) {
-        if (bets[id]?.status === "reserved") {
-          bets[id] = { ...bets[id], status: "accepted", updatedAt: Date.now() };
-          changed = true;
-        }
-      }
-      return changed ? { ...user, lionBets: bets } : undefined;
-    }).catch(error => console.error("BET STATUS BATCH ERROR:", error.message));
-  }, 1400);
+// The durable bet reservation already lives in Users/{uid}/lionBets.
+// After the game ledger commit, a second whole-user CAS simply to rename
+// "reserved" -> "accepted" caused many ETag conflicts (2–16 seconds observed).
+// The Android client treats a durable "reserved" record as awaiting ledger
+// acknowledgement, and the socket ACK as confirmation. No extra money write.
+// A failed game write still uses refundAll() to mark "refunded" atomically.
+function scheduleAcceptedStatuses(_uid, _ids) {
+  // Intentionally no additional Firebase wallet transaction.
 }
 
 // Merge nearby client batches for the same authenticated user and round.
 // A single durable wallet/game commit can cover many rapid clicks; each caller
 // receives its own ACK only after that commit. Never merge across rounds.
 const waitingBatchGroups = new Map();
-const SERVER_BATCH_MS = 65;
+const SERVER_BATCH_MS = 140; // Fewer full-user CAS writes during rapid taps
 const MAX_SERVER_BATCH_BETS = 200;
 function collectBetBatch(uid, items, admission) {
   return new Promise(resolve => {
