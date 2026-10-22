@@ -301,24 +301,39 @@ const incomingBets = new Map();
 const MAX_SETTLE_WAIT_MS = 0; // legacy constant (no forced cutoff)
 let lastCloseProgressAt = 0;
 
+// Track unverified admissions and per-player outstanding bets separately.
+// One player's wallet credit must not wait for OTHER players' pending bets.
+const unknownIncoming = new Map();
+const userIncoming = new Map();
 function beginIncoming(round) {
   incomingBets.set(round, (incomingBets.get(round) || 0) + 1);
+  unknownIncoming.set(round, (unknownIncoming.get(round) || 0) + 1);
 }
-function endIncoming(round) {
-  const count = (incomingBets.get(round) || 0) - 1;
-  if (count <= 0) {
-    incomingBets.delete(round);
-    // Start crediting without waiting for the one-second fallback timer.
-    // Only durable bets can be credited; settlePending is idempotent.
-    const drawn = historyArray(game?.history).some(
-      item => Number(item.roundNumber) === Number(round));
-    if (drawn) setImmediate(() => settlePending().catch(console.error));
+function identifyIncoming(round, uid) {
+  unknownIncoming.set(round, Math.max(0, (unknownIncoming.get(round) || 0) - 1));
+  let byUser = userIncoming.get(round);
+  if (!byUser) { byUser = new Map(); userIncoming.set(round, byUser); }
+  byUser.set(uid, (byUser.get(uid) || 0) + 1);
+}
+function endIncoming(round, uid = null) {
+  if (uid) {
+    const byUser = userIncoming.get(round);
+    if (byUser) {
+      const remaining = (byUser.get(uid) || 0) - 1;
+      if (remaining <= 0) byUser.delete(uid);
+      else byUser.set(uid, remaining);
+      if (!byUser.size) userIncoming.delete(round);
+    }
   } else {
-    incomingBets.set(round, count);
-    const drawn = historyArray(game?.history).some(
-      item => Number(item.roundNumber) === Number(round));
-    if (drawn) setImmediate(() => settlePending().catch(console.error));
+    unknownIncoming.set(round, Math.max(0, (unknownIncoming.get(round) || 0) - 1));
   }
+  if ((unknownIncoming.get(round) || 0) === 0) unknownIncoming.delete(round);
+  const count = (incomingBets.get(round) || 0) - 1;
+  if (count <= 0) incomingBets.delete(round);
+  else incomingBets.set(round, count);
+  const drawn = historyArray(game?.history).some(
+    item => Number(item.roundNumber) === Number(round));
+  if (drawn) setImmediate(() => settlePending().catch(console.error));
 }
 function admissionFor(data) {
   if (!firebaseReady || !game) return errorResult("SERVER_NOT_READY");
@@ -1170,14 +1185,14 @@ async function settlePending() {
       if (!entry || ![1, 2].includes(entry.payoutVersion)) continue;
       const round = Number(entry.roundNumber);
       const winnerIndex = Number(entry.winningIndex);
-      // Pay exactly ONCE per player/round, after all pre-deadline requests
-      // have finished persisting. Paying while the ledger is still growing
-      // results in multiple wallet credits for repeated clicks on one slot.
+      // A verified player's payout is ready once all THEIR admitted wagers
+      // have finished. Unknown-auth requests must finish first, since one may
+      // belong to that player. Do not hold all payouts for the slowest player.
       const stillIncoming = (incomingBets.get(round) || 0) > 0 ||
         [...waitingBatchGroups.keys()].some(k => k.endsWith(`:${round}`));
-      if (stillIncoming) continue;
-      // Refresh the round ledger after the admission barrier, rather than
-      // using an earlier snapshot that might omit the last committed batch.
+      if ((unknownIncoming.get(round) || 0) > 0) continue;
+      // Refresh the ledger: new successful reservations may have been added
+      // since the initial snapshot. Final TOP/history still wait for everyone.
       const latestEntrySnap = await gameRef().child("pendingSettlement").child(key).once("value");
       const completeEntry = latestEntrySnap.val();
       if (!completeEntry || completeEntry.settled === true) continue;
@@ -1194,6 +1209,10 @@ async function settlePending() {
       let allPaid = true;
       const changes = {};
       const payments = await Promise.all([...grouped.entries()].map(async ([uid, bets]) => {
+        if ((userIncoming.get(round)?.get(uid) || 0) > 0 ||
+            waitingBatchGroups.has(`${uid}:${round}`)) {
+          return { uid, ok: false, credited: 0, waitingForOwnBets: true };
+        }
         try {
           const result = await creditWinningBets(uid, round, bets);
           return { uid, ...result };
@@ -1211,9 +1230,9 @@ async function settlePending() {
           roundNumber: round, creditedAt: Date.now(), payouts: changes
         });
       }
-      // All incoming bets were drained BEFORE crediting. Failed payments
-      // stay pending and retry with the per-bet idempotency markers.
-      if (!allPaid) continue;
+      // Publish final TOP only when all admitted requests are done; do not
+      // postpone a ready player's wallet credit for another player's delay.
+      if (stillIncoming || !allPaid) continue;
       if (entry.settled !== true) {
         await gameRef().child("pendingSettlement").child(key).update({
           settled: true, settledAt: Date.now()
@@ -1861,11 +1880,14 @@ io.on("connection", socket => {
         return;
       }
       beginIncoming(admission.round);
+      let admittedUid = null;
       try {
         // Firebase wallet reads/writes for the same account must not race.
         // Validate account identity before queuing. The original reception time
         // was already captured in admissionFor().
         const decoded = await verifyToken(String(data?.idToken || ""));
+        admittedUid = decoded.uid;
+        identifyIncoming(admission.round, admittedUid);
         const result = await collectBetBatch(decoded.uid, [{
           betId: data.betId, foodIndex: data.foodIndex, amount: data.amount
         }], admission);
@@ -1874,7 +1896,7 @@ io.on("connection", socket => {
         console.error("SOCKET BET ERROR:", error.message);
         reply(errorResult(error.message === "INVALID_TOKEN" ? "INVALID_TOKEN" : "BET_STATUS_UNCERTAIN"));
       } finally {
-        endIncoming(admission.round);
+        endIncoming(admission.round, admittedUid);
       }
     }
   );
@@ -1887,14 +1909,17 @@ io.on("connection", socket => {
     if (!admission.ok) { reply(admission); return; }
     if (items.length > 200) { reply(errorResult("INVALID_BET_BATCH")); return; }
     beginIncoming(admission.round);
+    let admittedUid = null;
     try {
       const user = await verifyToken(String(data?.idToken || ""));
+      admittedUid = user.uid;
+      identifyIncoming(admission.round, admittedUid);
       const result = await collectBetBatch(user.uid, items, admission);
       reply(result);
     } catch (e) {
       console.error("BATCH BET ERROR", e.message);
       reply(errorResult(e.message === "INVALID_TOKEN" ? "INVALID_TOKEN" : "BET_STATUS_UNCERTAIN"));
-    } finally { endIncoming(admission.round); }
+    } finally { endIncoming(admission.round, admittedUid); }
   });
 
   socket.on("greedy_lion_leave", () => {
