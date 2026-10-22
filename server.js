@@ -165,6 +165,7 @@ async function transactionReady(ref, updater) {
 // provisional null). If a concurrent update wins, HTTP 412 makes us retry.
 // This never creates a missing wallet and never updates another user's path.
 async function walletTransactionReady(ref, updater) {
+  const walletOpStarted = Date.now();
   const base = String(ref.toString());
   if (!base.startsWith(DB_URL + "/Users/")) {
     throw new Error("INVALID_WALLET_PATH");
@@ -203,6 +204,8 @@ async function walletTransactionReady(ref, updater) {
       // on this non-authoritative data copy.
       scheduleWalletShadow(uid);
     }
+    const elapsedMs = Date.now() - walletOpStarted;
+    if (elapsedMs > 1500) console.warn("SLOW_WALLET_CAS", { elapsedMs, attempts: attempt + 1 });
     return { committed: true, snapshot: snapshot(saved) };
   }
   throw new Error("WALLET_CONCURRENT_RETRY_EXHAUSTED");
@@ -1214,7 +1217,7 @@ async function settlePending() {
           return { uid, ok: false, credited: 0, waitingForOwnBets: true };
         }
         try {
-          const result = await creditWinningBets(uid, round, bets);
+          const result = await enqueueUserBet(uid, () => creditWinningBets(uid, round, bets));
           return { uid, ...result };
         } catch (error) {
           console.error("PAYOUT ERROR", uid, error.message);
@@ -1501,10 +1504,12 @@ app.post("/api/gifts/send", async (req, res) => {
     // Authentication, exact amount, balance and idempotency are enforced
     // atomically by chargeGift() below. Recipient is chosen by sender.
 
-    const payment = await chargeGift(
+    // Serialize gifts with the same user's wagers and credited winnings.
+    // No read-only or optimistic wallet may be spent twice.
+    const payment = await enqueueUserBet(uid, () => chargeGift(
       uid,
       request
-    );
+    ));
 
     if (!payment.ok) {
       return giftError(
@@ -1573,7 +1578,7 @@ function scheduleAcceptedStatuses(uid, ids) {
     if (pendingStatusByUser.get(uid) !== job) return;
     pendingStatusByUser.delete(uid);
     const betIds = [...job.ids];
-    enqueueUserBet(uid, () => walletTransactionReady(userRef(uid), user => {
+    walletTransactionReady(userRef(uid), user => {
       if (!user) return;
       const bets = { ...(user.lionBets || {}) };
       let changed = false;
@@ -1584,7 +1589,7 @@ function scheduleAcceptedStatuses(uid, ids) {
         }
       }
       return changed ? { ...user, lionBets: bets } : undefined;
-    })).catch(error => console.error("BET STATUS BATCH ERROR:", error.message));
+    }).catch(error => console.error("BET STATUS BATCH ERROR:", error.message));
   }, 1400);
 }
 
