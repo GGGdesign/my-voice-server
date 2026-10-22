@@ -336,16 +336,12 @@ async function walletV2Cas(uid, updater) {
   throw Error('V2_CONCURRENT_RETRY_EXHAUSTED');
 }
 const initializingV2 = new Map();
-// Cache only successfully verified wallet existence within this server process.
-const readyV2Wallets = new Set();
 async function ensureV2(uid) {
   if (!validId(uid)) throw Error('INVALID_UID');
   const store = walletV2();
-  if (readyV2Wallets.has(uid)) return store;
   const existing = await store.refFor(uid).child('balance').once('value');
   if (existing.exists()) {
     v2Amount(existing.val());
-    readyV2Wallets.add(uid);
     return store;
   }
   if (initializingV2.has(uid)) return initializingV2.get(uid);
@@ -367,7 +363,6 @@ async function ensureV2(uid) {
     });
     if (!result.wallet || typeof result.wallet.balance !== 'string') throw Error('V2_INIT_FAILED');
     console.log('WALLET_V2_ACTIVE', {uidSuffix:uid.slice(-5),initialized:result.committed});
-    readyV2Wallets.add(uid);
     return store;
   })();
   initializingV2.set(uid, job);
@@ -1648,7 +1643,11 @@ function scheduleAcceptedStatuses(_uid, _ids) {
 // A single durable wallet/game commit can cover many rapid clicks; each caller
 // receives its own ACK only after that commit. Never merge across rounds.
 const waitingBatchGroups = new Map();
-const SERVER_BATCH_MS = 170; // Save one larger durable debit per burst instead of many tiny debits
+// Debounce rapid taps: combine a burst into ONE committed wallet debit.
+// A fixed 50ms timer fragmented a rapid burst into many small debits.
+// The hard cap ensures sustained tapping is still committed periodically.
+const SERVER_BATCH_QUIET_MS = 550;
+const SERVER_BATCH_MAX_WAIT_MS = 1500;
 const MAX_SERVER_BATCH_BETS = 200;
 function collectBetBatch(uid, items, admission) {
   return new Promise(resolve => {
@@ -1658,18 +1657,27 @@ function collectBetBatch(uid, items, admission) {
       flushBetGroup(key);
       group = null;
     }
+    const now = Date.now();
     if (!group) {
       group = { uid, round: admission.round, receivedAt: admission.receivedAt,
-        items: [], calls: [], count: 0, timer: null };
+        startedAt: now, items: [], calls: [], count: 0, timer: null };
       waitingBatchGroups.set(key, group);
-      group.timer = setTimeout(() => flushBetGroup(key), SERVER_BATCH_MS);
     }
     group.items.push(...items);
     group.calls.push({ resolve, betIds: items.map(x => String(x.betId)) });
     group.count += items.length;
     group.receivedAt = Math.min(group.receivedAt, admission.receivedAt);
-    if (group.count >= MAX_SERVER_BATCH_BETS ||
-        Date.now() >= Number(game?.roundEndsAt || 0) - 600) flushBetGroup(key);
+    const deadline = Number(game?.roundEndsAt || 0);
+    if (group.count >= MAX_SERVER_BATCH_BETS || (deadline && now >= deadline - 250)) {
+      flushBetGroup(key);
+      return;
+    }
+    // A pause combines the whole burst; never defer forever during constant taps.
+    const remainingMax = Math.max(0, SERVER_BATCH_MAX_WAIT_MS - (now - group.startedAt));
+    const remainingRound = deadline ? Math.max(0, deadline - now) : SERVER_BATCH_QUIET_MS;
+    const delay = Math.min(SERVER_BATCH_QUIET_MS, remainingMax, remainingRound);
+    clearTimeout(group.timer);
+    group.timer = setTimeout(() => flushBetGroup(key), delay);
   });
 }
 function flushBetGroup(key) {
