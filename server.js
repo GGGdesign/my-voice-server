@@ -309,46 +309,85 @@ async function readWallet(uid, operation) {
 const { createWalletStore } = require('./maxchat_wallet_migration/firebase-wallet-adapter');
 const { amount: v2Amount, createWallet: v2Create, debit: v2Debit, credit: v2Credit } = require('./maxchat_wallet_migration/compact-wallet');
 const walletV2 = () => createWalletStore(db());
-const v2ReadyForMigration = async uid => {
-  // Never snapshot Users/coins while any old round can still debit or pay.
-  const pending = (await gameRef().child('pendingSettlement').once('value')).val() || {};
-  if (Object.values(pending).some(e => e && e.settled !== true)) throw Error('OLD_PAYOUTS_PENDING');
-  // The new request may be queued in waitingBatchGroups; this is not an old debit.
-  // On a single-instance deployment, all legacy settlement records are checked above.
-};
+// Firebase REST ETag CAS reads only the compact wallet, never the huge Users tree.
+// Unlike an SDK transaction, its updater receives a persisted snapshot, not a provisional null.
+async function walletV2Cas(uid, updater) {
+  if (!validId(uid)) throw Error('INVALID_UID');
+  const access = await admin.app().options.credential.getAccessToken();
+  if (!access?.access_token) throw Error('FIREBASE_ACCESS_TOKEN_MISSING');
+  const url = `${DB_URL}/walletV2/${encodeURIComponent(uid)}.json`;
+  const headers = { Authorization: `Bearer ${access.access_token}` };
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const get = await fetch(url, { headers: {...headers, 'X-Firebase-ETag':'true'},
+      signal: AbortSignal.timeout(12000) });
+    if (!get.ok) throw Error(`V2_READ_HTTP_${get.status}`);
+    const etag = get.headers.get('etag');
+    if (!etag) throw Error('V2_ETAG_MISSING');
+    const before = await get.json();
+    const after = updater(before);
+    if (after === undefined) return { committed:false, wallet:before };
+    const put = await fetch(url, { method:'PUT',
+      headers:{...headers,'Content-Type':'application/json','If-Match':etag},
+      body:JSON.stringify(after), signal: AbortSignal.timeout(12000) });
+    if (put.status === 412) continue;
+    if (!put.ok) throw Error(`V2_WRITE_HTTP_${put.status}`);
+    return { committed:true, wallet:await put.json() };
+  }
+  throw Error('V2_CONCURRENT_RETRY_EXHAUSTED');
+}
+const initializingV2 = new Map();
 async function ensureV2(uid) {
+  if (!validId(uid)) throw Error('INVALID_UID');
   const store = walletV2();
   const existing = await store.refFor(uid).child('balance').once('value');
-  if (existing.exists()) return store;
-  await v2ReadyForMigration(uid);
-  const source = await userRef(uid).child('coins').once('value');
-  const original = exactCoins(source.val());
-  if (!source.exists() || original === null) throw Error('INVALID_SOURCE_BALANCE');
-  await store.initIfEmpty(uid, original.toString());
-  console.log('WALLET_V2_ACTIVE', {uidSuffix:uid.slice(-5)});
-  return store;
+  if (existing.exists()) {
+    v2Amount(existing.val());
+    return store;
+  }
+  if (initializingV2.has(uid)) return initializingV2.get(uid);
+  const job = (async () => {
+    // Don't fork balances while a previous version has unpaid prizes.
+    const pending = (await gameRef().child('pendingSettlement').once('value')).val() || {};
+    if (Object.values(pending).some(e => e && e.settled !== true)) {
+      throw Error('OLD_PAYOUTS_PENDING');
+    }
+    if (game?.activeBets && Object.keys(game.activeBets).length) {
+      throw Error('OLD_BETS_STILL_ACTIVE');
+    }
+    const source = await userRef(uid).child('coins').once('value');
+    const original = exactCoins(source.val());
+    if (!source.exists() || original === null) throw Error('INVALID_SOURCE_BALANCE');
+    const result = await walletV2Cas(uid, current => {
+      if (current !== null) return;
+      return v2Create(original.toString());
+    });
+    if (!result.wallet || typeof result.wallet.balance !== 'string') throw Error('V2_INIT_FAILED');
+    console.log('WALLET_V2_ACTIVE', {uidSuffix:uid.slice(-5),initialized:result.committed});
+    return store;
+  })();
+  initializingV2.set(uid, job);
+  try { return await job; }
+  finally { if (initializingV2.get(uid) === job) initializingV2.delete(uid); }
 }
 async function v2Batch(uid, kind, entries) {
-  const store = await ensureV2(uid);
   if (!entries.length) throw Error('EMPTY_WALLET_BATCH');
-  const tx = await store.refFor(uid).transaction(old => {
-    if (!old || typeof old.balance !== 'string') return;
-    let next = old, changed = false;
-    const oldOps=kind === 'debit' ? old.debits||{} : old.credits||{};
-    const already=entries.filter(x=>oldOps[x.id]!==undefined);
-    if (already.length && already.length!==entries.length) throw Error('PARTIAL_WALLET_BATCH');
+  await ensureV2(uid);
+  const tx = await walletV2Cas(uid, old => {
+    if (!old || typeof old.balance !== 'string') throw Error('WALLET_V2_NOT_AVAILABLE');
+    let next=old, changed=false;
+    const ops=kind === 'debit' ? old.debits||{} : old.credits||{};
+    const already=entries.filter(x=>ops[x.id]!==undefined);
+    if (already.length && already.length !== entries.length) throw Error('PARTIAL_WALLET_BATCH');
     for (const item of entries) {
-      const result = (kind === 'debit' ? v2Debit : v2Credit)(next,item.id,String(item.amount));
-      if (result.repeated) continue;
-      changed = true; next = result.wallet;
+      const applied=(kind === 'debit' ? v2Debit : v2Credit)(next,item.id,String(item.amount));
+      if (!applied.repeated) { next=applied.wallet; changed=true; }
     }
     return changed ? next : undefined;
-  },undefined,false);
-  const saved = tx.snapshot.val();
-  if (!saved || typeof saved.balance !== 'string') throw Error('WALLET_V2_NOT_AVAILABLE');
-  const ops = kind === 'debit' ? saved.debits || {} : saved.credits || {};
-  if (!entries.every(x => ops[x.id] === String(x.amount))) throw Error('WALLET_V2_OPERATION_UNCONFIRMED');
-  return {balance:saved.balance, newlyApplied:tx.committed};
+  });
+  const saved=tx.wallet;
+  const ops=kind === 'debit' ? saved?.debits||{} : saved?.credits||{};
+  if (!entries.every(x => ops[x.id] === String(x.amount))) throw Error('V2_OPERATION_UNCONFIRMED');
+  return { balance:saved.balance, newlyApplied:tx.committed };
 }
 const v2BetId = id => `lion_${id}`;
 async function v2ReserveBatch(uid, items) {
@@ -1390,16 +1429,15 @@ async function chargeGift(uid,request) {
   const store=await ensureV2(uid);
   const id=`gift_${request.requestId.replace(/-/g,'_')}`;
   const signature=[request.roomId,request.giftId,request.receiverId,request.quantity,request.amount].join(':');
-  const ref=store.refFor(uid);
-  const tx=await ref.transaction(old=>{
-    if (!old || typeof old.balance !== 'string') return;
+  const tx=await walletV2Cas(uid, old=>{
+    if (!old || typeof old.balance !== 'string') throw Error('WALLET_V2_NOT_AVAILABLE');
     const previous=old.giftSignatures?.[id];
     if(previous && previous!==signature) throw Error('REQUEST_ID_CONFLICT');
     if(previous) return;
     const result=v2Debit(old,id,String(request.amount));
     return {...result.wallet,giftSignatures:{...(old.giftSignatures||{}),[id]:signature}};
-  },undefined,false);
-  const saved=tx.snapshot.val();
+  });
+  const saved=tx.wallet;
   if(saved?.giftSignatures?.[id]!==signature || saved?.debits?.[id]!==String(request.amount))
     return errorResult('GIFT_NOT_COMMITTED');
   const profile=(await userRef(uid).once('value')).val()||{};
