@@ -304,6 +304,77 @@ async function readWallet(uid, operation) {
   return { ok: true, uid, coins: storedCoins(coins), user };
 }
 
+
+// === LIVE V2: one small authoritative balance, authenticated activation ===
+const { createWalletStore } = require('./maxchat_wallet_migration/firebase-wallet-adapter');
+const { amount: v2Amount, createWallet: v2Create, debit: v2Debit, credit: v2Credit } = require('./maxchat_wallet_migration/compact-wallet');
+const walletV2 = () => createWalletStore(db());
+const v2ReadyForMigration = async uid => {
+  // Never snapshot Users/coins while any old round can still debit or pay.
+  const pending = (await gameRef().child('pendingSettlement').once('value')).val() || {};
+  if (Object.values(pending).some(e => e && e.settled !== true)) throw Error('OLD_PAYOUTS_PENDING');
+  // The new request may be queued in waitingBatchGroups; this is not an old debit.
+  // On a single-instance deployment, all legacy settlement records are checked above.
+};
+async function ensureV2(uid) {
+  const store = walletV2();
+  const existing = await store.refFor(uid).child('balance').once('value');
+  if (existing.exists()) return store;
+  await v2ReadyForMigration(uid);
+  const source = await userRef(uid).child('coins').once('value');
+  const original = exactCoins(source.val());
+  if (!source.exists() || original === null) throw Error('INVALID_SOURCE_BALANCE');
+  await store.initIfEmpty(uid, original.toString());
+  console.log('WALLET_V2_ACTIVE', {uidSuffix:uid.slice(-5)});
+  return store;
+}
+async function v2Batch(uid, kind, entries) {
+  const store = await ensureV2(uid);
+  if (!entries.length) throw Error('EMPTY_WALLET_BATCH');
+  const tx = await store.refFor(uid).transaction(old => {
+    if (!old || typeof old.balance !== 'string') return;
+    let next = old, changed = false;
+    const oldOps=kind === 'debit' ? old.debits||{} : old.credits||{};
+    const already=entries.filter(x=>oldOps[x.id]!==undefined);
+    if (already.length && already.length!==entries.length) throw Error('PARTIAL_WALLET_BATCH');
+    for (const item of entries) {
+      const result = (kind === 'debit' ? v2Debit : v2Credit)(next,item.id,String(item.amount));
+      if (result.repeated) continue;
+      changed = true; next = result.wallet;
+    }
+    return changed ? next : undefined;
+  },undefined,false);
+  const saved = tx.snapshot.val();
+  if (!saved || typeof saved.balance !== 'string') throw Error('WALLET_V2_NOT_AVAILABLE');
+  const ops = kind === 'debit' ? saved.debits || {} : saved.credits || {};
+  if (!entries.every(x => ops[x.id] === String(x.amount))) throw Error('WALLET_V2_OPERATION_UNCONFIRMED');
+  return {balance:saved.balance, newlyApplied:tx.committed};
+}
+const v2BetId = id => `lion_${id}`;
+async function v2ReserveBatch(uid, items) {
+  return v2Batch(uid, 'debit', items.map(x => ({id:v2BetId(x.betId),amount:x.amount})));
+}
+async function v2RefundBatch(uid,items) {
+  return v2Batch(uid,'credit', items.map(x=>({id:`refund_${x.betId}`,amount:x.amount})));
+}
+async function v2PayWinners(uid,round,bets) {
+  const entries = bets.map(x=>({id:`win_${round}_${x.betId}`,
+    amount:(BigInt(x.amount)*BigInt(MULTIPLIERS[x.foodIndex])).toString()}));
+  const result = await v2Batch(uid,'credit',entries);
+  return {ok:true,credited:result.newlyApplied ? entries.reduce((sum,x)=>sum+BigInt(x.amount),0n).toString():'0'};
+}
+app.post('/api/wallet-v2/activate', async (req,res)=>{
+  try {
+    const {uid}=await verifyHttpUser(req);
+    const store=await ensureV2(uid);
+    const snap=await store.refFor(uid).child('balance').once('value');
+    return res.json({ok:true,mode:'LIVE_V2',balance:snap.val()});
+  } catch(error) {
+    console.error('V2 ACTIVATE:',error.message);
+    return res.status(409).json({ok:false,error:error.message});
+  }
+});
+
 // ==================================================
 // GAME STATE
 // ==================================================
@@ -934,6 +1005,8 @@ async function refundBet(uid, betId) {
 }
 
 async function placeBet(data, admission) {
+  return errorResult("USE_BATCH_V2");
+
   if (!BETTING_ENABLED) {
     return errorResult("BETTING_DISABLED");
   }
@@ -1141,6 +1214,8 @@ async function placeBet(data, admission) {
 // Older round-level payouts without bet markers are treated as already paid.
 async function creditWinningBets(uid, roundNumber, winningBets) {
   if (!winningBets.length) return { ok: true, credited: 0 };
+  const v2Active = await walletV2().refFor(uid).child('balance').once('value');
+  if (v2Active.exists()) return v2PayWinners(uid,roundNumber,winningBets);
   const key = String(roundNumber);
   let newlyCredited = 0n;
   const tx = await walletTransactionReady(userRef(uid), user => {
@@ -1311,76 +1386,26 @@ async function giftReceiverOnSeat(
   return found;
 }
 
-async function chargeGift(uid, request) {
-  // /api/gifts/send already checked the sender and possible retry. The
-  // transaction itself checks the actual balance against concurrent charges.
-  let reason = "PAYMENT_REJECTED";
-
-  const tx = await walletTransactionReady(
-    userRef(uid),
-    user => {
-      if (!user) {
-        reason = "WALLET_TRANSACTION_EMPTY";
-        return;
-      }
-
-      const payments = user.giftPayments || {};
-      const previous = payments[request.requestId];
-
-      if (previous) {
-        reason = sameGiftPayment(previous, request)
-          ? "ALREADY_PAID"
-          : "REQUEST_ID_CONFLICT";
-        return;
-      }
-
-      const coins = exactCoins(user.coins);
-
-      if (coins === null) {
-        reason = "INVALID_WALLET";
-        return;
-      }
-
-      if (coins < BigInt(request.amount)) {
-        reason = "INSUFFICIENT_COINS";
-        return;
-      }
-
-      return {
-        ...user,
-        coins: storedCoins(coins - BigInt(request.amount)),
-        giftPayments: {
-          ...payments,
-          [request.requestId]: {
-            roomId: request.roomId,
-            giftId: request.giftId,
-            receiverId: request.receiverId,
-            quantity: request.quantity,
-            amount: request.amount,
-            status: "paid",
-            createdAt: Date.now()
-          }
-        }
-      };
-    }
-  );
-
-  const saved = tx.snapshot.val();
-  const payment =
-    saved?.giftPayments?.[request.requestId];
-
-  if (!sameGiftPayment(payment, request)) {
-    return errorResult(reason);
-  }
-
-  return {
-    ok: true,
-    newlyCharged: tx.committed,
-    balance: saved.coins,
-    senderId: String(saved.customId || ""),
-    senderName: profileName(saved),
-    createdAt: payment.createdAt
-  };
+async function chargeGift(uid,request) {
+  const store=await ensureV2(uid);
+  const id=`gift_${request.requestId.replace(/-/g,'_')}`;
+  const signature=[request.roomId,request.giftId,request.receiverId,request.quantity,request.amount].join(':');
+  const ref=store.refFor(uid);
+  const tx=await ref.transaction(old=>{
+    if (!old || typeof old.balance !== 'string') return;
+    const previous=old.giftSignatures?.[id];
+    if(previous && previous!==signature) throw Error('REQUEST_ID_CONFLICT');
+    if(previous) return;
+    const result=v2Debit(old,id,String(request.amount));
+    return {...result.wallet,giftSignatures:{...(old.giftSignatures||{}),[id]:signature}};
+  },undefined,false);
+  const saved=tx.snapshot.val();
+  if(saved?.giftSignatures?.[id]!==signature || saved?.debits?.[id]!==String(request.amount))
+    return errorResult('GIFT_NOT_COMMITTED');
+  const profile=(await userRef(uid).once('value')).val()||{};
+  return {ok:true,newlyCharged:tx.committed,balance:saved.balance,
+    senderId:String(profile.customId||''),senderName:profileName(profile),
+    createdAt:Date.now()};
 }
 
 async function publishGift(uid, request, payment) {
@@ -1659,38 +1684,14 @@ async function placeBetBatch(uid, requests, admission) {
   if (occupied.size > 6) return errorResult("MAX_SIX_SLOTS");
   const sum = items.reduce((n, x) => n + x.amount, 0);
   if (!Number.isSafeInteger(sum)) return errorResult("INVALID_BET_BATCH");
-  let reason = "WALLET_REJECTED";
-  const reservation = await walletTransactionReady(userRef(uid), user => {
-    if (!user) { reason = "USER_NOT_FOUND"; return; }
-    const prior = user.lionBets || {};
-    if (items.some(x => prior[x.betId])) { reason = "DUPLICATE_BET"; return; }
-    const coins = exactCoins(user.coins);
-    if (coins === null) { reason = "INVALID_WALLET"; return; }
-    if (coins < BigInt(sum)) { reason = "INSUFFICIENT_COINS"; return; }
-    const additions = {};
-    for (const item of items) additions[item.betId] = {
-      amount: item.amount, roundNumber: round, foodIndex: item.foodIndex,
-      status: "reserved", createdAt: Date.now()
-    };
-    return { ...user, coins: storedCoins(coins - BigInt(sum)), lionBets: { ...prior, ...additions } };
-  });
-  if (!reservation.committed) return errorResult(reason);
+  let reservation;
+  try { reservation=await v2ReserveBatch(uid,items); }
+  catch(e) { return errorResult(e.message); }
   const refundAll = async () => {
-    const tx = await walletTransactionReady(userRef(uid), user => {
-      if (!user) return;
-      const bets = { ...(user.lionBets || {}) };
-      let refund = 0;
-      for (const item of items) {
-        if (bets[item.betId]?.status !== "reserved") continue;
-        refund += item.amount;
-        bets[item.betId] = { ...bets[item.betId], status: "refunded", refundedAt: Date.now() };
-      }
-      if (!refund) return;
-      const coins = exactCoins(user.coins);
-      if (coins === null || coins + BigInt(refund) > MAX_ACCOUNT_COINS) return;
-      return { ...user, coins: storedCoins(coins + BigInt(refund)), lionBets: bets };
-    });
-    return tx.committed || items.every(x => tx.snapshot.val()?.lionBets?.[x.betId]?.status === "refunded");
+    // Never refund a replayed reservation; that would mint coins on duplicate requests.
+    if (!reservation.newlyApplied) return false;
+    try { await v2RefundBatch(uid,items); return true; }
+    catch(e) { console.error('V2 REFUND ERROR',e.message); return false; }
   };
   try {
     let rejection = "BET_REJECTED";
@@ -1726,11 +1727,14 @@ async function placeBetBatch(uid, requests, admission) {
       };
       return { ...current, activeBets: active };
     });
-    if (!tx.committed) return errorResult((await refundAll()) ? rejection : "REFUND_PENDING");
+    if (!tx.committed) {
+      if (!reservation.newlyApplied) return errorResult("BET_STATUS_UNCERTAIN");
+      return errorResult((await refundAll()) ? rejection : "REFUND_PENDING");
+    }
     game = tx.snapshot.val();
     // Confirmation follows durable wallet debit + game entry, not this optional status mirror.
     scheduleAcceptedStatuses(uid, items.map(x => x.betId));
-    return { ok: true, roundNumber: round, betIds: items.map(x => x.betId), balance: reservation.snapshot.val()?.coins };
+    return { ok: true, roundNumber: round, betIds: items.map(x => x.betId), balance: reservation.balance };
   } catch (error) {
     console.error("BATCH COMMIT ERROR", error.message);
     // An uncertain game transaction must be checked before any refund.
@@ -2009,7 +2013,6 @@ app.get("/api/wallet/migration-status", async (req, res) => {
 // No migration, minting, debiting, or crediting happens in this endpoint.
 // Only the Firebase-authenticated user can inspect their own readiness.
 // ==================================================
-const { createWalletStore } = require('./maxchat_wallet_migration/firebase-wallet-adapter');
 const { amount: parseWalletV2Amount } = require('./maxchat_wallet_migration/compact-wallet');
 
 app.get('/api/wallet-v2/readiness', async (req, res) => {
@@ -2034,11 +2037,11 @@ app.get('/api/wallet-v2/readiness', async (req, res) => {
       } catch (_) {}
     }
     return res.json({
-      ok: true, mode: 'READ_ONLY_NOT_MIGRATED',
+      ok: true, mode: newSnap.exists() ? 'LIVE_V2' : 'NOT_YET_ACTIVATED',
       source: 'Users/{uid}/coins', target: 'walletV2/{uid}/balance',
       targetExists: newSnap.exists(), targetValid: v2Valid,
       currentlySameAmount: v2MatchesSource,
-      warning: 'The server still uses Users/coins for all real bets, payouts and gifts. No migration was performed.'
+      warning: newSnap.exists() ? 'walletV2 is authoritative. Users/coins is a legacy snapshot.' : 'POST /api/wallet-v2/activate with Firebase Bearer token to activate.'
     });
   } catch (error) {
     console.error('WALLET V2 READINESS ERROR:', error.message);
