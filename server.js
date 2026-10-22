@@ -317,6 +317,9 @@ async function walletV2Cas(uid, updater) {
   if (!access?.access_token) throw Error('FIREBASE_ACCESS_TOKEN_MISSING');
   const url = `${DB_URL}/walletV2/${encodeURIComponent(uid)}.json`;
   const headers = { Authorization: `Bearer ${access.access_token}` };
+  // Read the persisted wallet via a REST ETag, never a provisional SDK transaction null.
+  // If RTDB REST returns a temporary null, independently verify with the Admin SDK
+  // before concluding that this previously initialized wallet has disappeared.
   for (let attempt = 0; attempt < 12; attempt++) {
     const get = await fetch(url, { headers: {...headers, 'X-Firebase-ETag':'true'},
       signal: AbortSignal.timeout(12000) });
@@ -324,8 +327,20 @@ async function walletV2Cas(uid, updater) {
     const etag = get.headers.get('etag');
     if (!etag) throw Error('V2_ETAG_MISSING');
     const before = await get.json();
+    if (!before || typeof before.balance !== 'string') {
+      const source = await walletV2().refFor(uid).once('value');
+      const actual = source.val();
+      if (actual && typeof actual.balance === 'string') {
+        // The two readers disagree; do NOT create or overwrite an existing wallet.
+        // Retry the REST GET, preserving all debits, credits and existing balance.
+        console.warn('V2_REST_SNAPSHOT_EMPTY_RETRY', { attempt: attempt + 1, uidSuffix: uid.slice(-5) });
+        continue;
+      }
+      throw Error('WALLET_V2_MISSING_ON_SERVER');
+    }
     const after = updater(before);
     if (after === undefined) return { committed:false, wallet:before };
+    if (!after || typeof after.balance !== 'string') throw Error('INVALID_V2_UPDATE');
     const put = await fetch(url, { method:'PUT',
       headers:{...headers,'Content-Type':'application/json','If-Match':etag},
       body:JSON.stringify(after), signal: AbortSignal.timeout(12000) });
@@ -333,15 +348,19 @@ async function walletV2Cas(uid, updater) {
     if (!put.ok) throw Error(`V2_WRITE_HTTP_${put.status}`);
     return { committed:true, wallet:await put.json() };
   }
-  throw Error('V2_CONCURRENT_RETRY_EXHAUSTED');
+  throw Error('V2_CONCURRENT_OR_SNAPSHOT_RETRY_EXHAUSTED');
 }
 const initializingV2 = new Map();
+const verifiedV2At = new Map();
+const VERIFIED_V2_TTL_MS = 60000;
 async function ensureV2(uid) {
   if (!validId(uid)) throw Error('INVALID_UID');
   const store = walletV2();
+  if (Date.now() - (verifiedV2At.get(uid) || 0) < VERIFIED_V2_TTL_MS) return store;
   const existing = await store.refFor(uid).child('balance').once('value');
   if (existing.exists()) {
     v2Amount(existing.val());
+    verifiedV2At.set(uid, Date.now());
     return store;
   }
   if (initializingV2.has(uid)) return initializingV2.get(uid);
@@ -363,6 +382,7 @@ async function ensureV2(uid) {
     });
     if (!result.wallet || typeof result.wallet.balance !== 'string') throw Error('V2_INIT_FAILED');
     console.log('WALLET_V2_ACTIVE', {uidSuffix:uid.slice(-5),initialized:result.committed});
+    verifiedV2At.set(uid, Date.now());
     return store;
   })();
   initializingV2.set(uid, job);
@@ -1643,11 +1663,7 @@ function scheduleAcceptedStatuses(_uid, _ids) {
 // A single durable wallet/game commit can cover many rapid clicks; each caller
 // receives its own ACK only after that commit. Never merge across rounds.
 const waitingBatchGroups = new Map();
-// Debounce rapid taps: combine a burst into ONE committed wallet debit.
-// A fixed 50ms timer fragmented a rapid burst into many small debits.
-// The hard cap ensures sustained tapping is still committed periodically.
-const SERVER_BATCH_QUIET_MS = 550;
-const SERVER_BATCH_MAX_WAIT_MS = 1500;
+const SERVER_BATCH_MS = 50; // Coalesce rapid taps while avoiding avoidable ACK delay
 const MAX_SERVER_BATCH_BETS = 200;
 function collectBetBatch(uid, items, admission) {
   return new Promise(resolve => {
@@ -1657,27 +1673,18 @@ function collectBetBatch(uid, items, admission) {
       flushBetGroup(key);
       group = null;
     }
-    const now = Date.now();
     if (!group) {
       group = { uid, round: admission.round, receivedAt: admission.receivedAt,
-        startedAt: now, items: [], calls: [], count: 0, timer: null };
+        items: [], calls: [], count: 0, timer: null };
       waitingBatchGroups.set(key, group);
+      group.timer = setTimeout(() => flushBetGroup(key), SERVER_BATCH_MS);
     }
     group.items.push(...items);
     group.calls.push({ resolve, betIds: items.map(x => String(x.betId)) });
     group.count += items.length;
     group.receivedAt = Math.min(group.receivedAt, admission.receivedAt);
-    const deadline = Number(game?.roundEndsAt || 0);
-    if (group.count >= MAX_SERVER_BATCH_BETS || (deadline && now >= deadline - 250)) {
-      flushBetGroup(key);
-      return;
-    }
-    // A pause combines the whole burst; never defer forever during constant taps.
-    const remainingMax = Math.max(0, SERVER_BATCH_MAX_WAIT_MS - (now - group.startedAt));
-    const remainingRound = deadline ? Math.max(0, deadline - now) : SERVER_BATCH_QUIET_MS;
-    const delay = Math.min(SERVER_BATCH_QUIET_MS, remainingMax, remainingRound);
-    clearTimeout(group.timer);
-    group.timer = setTimeout(() => flushBetGroup(key), delay);
+    if (group.count >= MAX_SERVER_BATCH_BETS ||
+        Date.now() >= Number(game?.roundEndsAt || 0) - 600) flushBetGroup(key);
   });
 }
 function flushBetGroup(key) {
@@ -1737,7 +1744,7 @@ async function placeBetBatch(uid, requests, admission) {
   if (!Number.isSafeInteger(sum)) return errorResult("INVALID_BET_BATCH");
   let reservation;
   try { reservation=await v2ReserveBatch(uid,items); }
-  catch(e) { return errorResult(e.message); }
+  catch(e) { console.error('V2 BET DEBIT FAILED', {error:e.message, uidSuffix:uid.slice(-5), count:items.length}); return errorResult(e.message); }
   const refundAll = async () => {
     // Never refund a replayed reservation; that would mint coins on duplicate requests.
     if (!reservation.newlyApplied) return false;
