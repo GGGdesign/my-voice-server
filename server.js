@@ -330,13 +330,15 @@ async function walletV2Cas(uid, updater) {
     if (!before || typeof before.balance !== 'string') {
       const source = await walletV2().refFor(uid).once('value');
       const actual = source.val();
+      const diagnostics = { uidSuffix: uid.slice(-5), attempt: attempt + 1,
+        restHasRecord: !!before, adminHasRecord: source.exists(),
+        adminHasBalance: typeof actual?.balance === 'string' };
+      console.error('V2_WALLET_READ_MISMATCH', diagnostics);
       if (actual && typeof actual.balance === 'string') {
-        // The two readers disagree; do NOT create or overwrite an existing wallet.
-        // Retry the REST GET, preserving all debits, credits and existing balance.
-        console.warn('V2_REST_SNAPSHOT_EMPTY_RETRY', { attempt: attempt + 1, uidSuffix: uid.slice(-5) });
+        // Never write stale or null data. Retry, then return a clear error.
         continue;
       }
-      throw Error('WALLET_V2_MISSING_ON_SERVER');
+      throw Error(source.exists() ? 'WALLET_V2_SCHEMA_INVALID' : 'WALLET_V2_UID_RECORD_MISSING');
     }
     const after = updater(before);
     if (after === undefined) return { committed:false, wallet:before };
@@ -357,9 +359,16 @@ async function ensureV2(uid) {
   if (!validId(uid)) throw Error('INVALID_UID');
   const store = walletV2();
   if (Date.now() - (verifiedV2At.get(uid) || 0) < VERIFIED_V2_TTL_MS) return store;
-  const existing = await store.refFor(uid).child('balance').once('value');
-  if (existing.exists()) {
-    v2Amount(existing.val());
+  const existingWallet = await store.refFor(uid).once('value');
+  const existing = existingWallet.val();
+  if (existingWallet.exists()) {
+    // An existing record must never be silently re-created from stale Users/coins.
+    if (!existing || typeof existing.balance !== 'string') {
+      console.error('V2_WALLET_SCHEMA_INVALID', { uidSuffix: uid.slice(-5), hasRecord: true,
+        fields: existing && typeof existing === 'object' ? Object.keys(existing).slice(0, 12) : [] });
+      throw Error('WALLET_V2_SCHEMA_INVALID');
+    }
+    v2Amount(existing.balance);
     verifiedV2At.set(uid, Date.now());
     return store;
   }
@@ -393,7 +402,7 @@ async function v2Batch(uid, kind, entries) {
   if (!entries.length) throw Error('EMPTY_WALLET_BATCH');
   await ensureV2(uid);
   const tx = await walletV2Cas(uid, old => {
-    if (!old || typeof old.balance !== 'string') throw Error('WALLET_V2_NOT_AVAILABLE');
+    if (!old || typeof old.balance !== 'string') throw Error('WALLET_V2_SCHEMA_INVALID');
     let next=old, changed=false;
     const ops=kind === 'debit' ? old.debits||{} : old.credits||{};
     const already=entries.filter(x=>ops[x.id]!==undefined);
@@ -422,6 +431,25 @@ async function v2PayWinners(uid,round,bets) {
   const result = await v2Batch(uid,'credit',entries);
   return {ok:true,credited:result.newlyApplied ? entries.reduce((sum,x)=>sum+BigInt(x.amount),0n).toString():'0'};
 }
+// Read-only account-bound wallet diagnostic; never changes coins.
+app.get('/api/wallet-v2/check', async (req, res) => {
+  let uid;
+  try { uid = (await verifyHttpUser(req)).uid; }
+  catch (_) { return res.status(401).json({ ok:false, error:'UNAUTHORIZED' }); }
+  try {
+    const record = await walletV2().refFor(uid).once('value');
+    const data = record.val();
+    const hasBalance = typeof data?.balance === 'string';
+    return res.json({ ok: hasBalance, build:'2026-10-22-v2-readable-1',
+      walletRecordExists: record.exists(), walletBalanceValid:hasBalance,
+      walletOperationHistory: !!(data?.debits || data?.credits),
+      error: hasBalance ? null : (record.exists() ? 'WALLET_V2_SCHEMA_INVALID' : 'WALLET_V2_UID_RECORD_MISSING') });
+  } catch (error) {
+    console.error('V2_CHECK_FAILED', { uidSuffix:uid.slice(-5), error:error.message });
+    return res.status(503).json({ ok:false, error:'V2_READ_FAILED' });
+  }
+});
+
 app.post('/api/wallet-v2/activate', async (req,res)=>{
   try {
     const {uid}=await verifyHttpUser(req);
@@ -1744,7 +1772,7 @@ async function placeBetBatch(uid, requests, admission) {
   if (!Number.isSafeInteger(sum)) return errorResult("INVALID_BET_BATCH");
   let reservation;
   try { reservation=await v2ReserveBatch(uid,items); }
-  catch(e) { console.error('V2 BET DEBIT FAILED', {error:e.message, uidSuffix:uid.slice(-5), count:items.length}); return errorResult(e.message); }
+  catch(e) { console.error('V2 BET DEBIT FAILED', {build:'2026-10-22-v2-readable-1', error:e.message, uidSuffix:uid.slice(-5), count:items.length}); return errorResult(e.message); }
   const refundAll = async () => {
     // Never refund a replayed reservation; that would mint coins on duplicate requests.
     if (!reservation.newlyApplied) return false;
@@ -2145,6 +2173,7 @@ app.get("/", (req, res) => {
 // ==================================================
 
 httpServer.listen(PORT, async () => {
+  console.log('MAXCHAT_WALLET_DIAGNOSTIC_BUILD', '2026-10-22-v2-readable-1');
   console.log("MAX CHAT SERVER RUNNING:", PORT);
   console.log("BETTING ENABLED:", BETTING_ENABLED);
   console.log("GIFTS ENABLED:", GIFTS_ENABLED);
